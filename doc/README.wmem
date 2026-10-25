@@ -339,6 +339,37 @@ It is basically the equivalent of a destructor function. For simplicity, wmem
 is guaranteed to call free_all() immediately before calling this function. There
 is no such guarantee that gc() has (ever) been called.
 
+4.1.1 Backing Stores
+
+A block allocator takes the large regions it serves allocations out of from
+the system heap by default. wmem_allocator_new_backed() lets it take them from
+a wmem_backing_t instead, which is a single large shared mapping of a sparse
+temporary file (see wmem_backing.h).
+
+The whole range is reserved and mapped once when the store is created, so
+addresses are stable and neither the allocator nor its consumers can tell the
+difference. What changes is where the pages end up under memory pressure: the
+kernel writes them to the backing file rather than failing the allocation, so
+a capture whose dissection state exceeds RAM is analyzed slowly instead of not
+at all. Access is random by nature (hash tables, trees), so the store asks the
+kernel not to read ahead.
+
+TShark exposes this with --spill-dir, which points the file scope (and the
+address resolution caches, which have the same lifetime) at a store. The
+frame_data_sequence built by two-pass analysis has its own block allocator on
+the same store, since it holds one frame_data per packet for the whole
+capture. Epan scope is never backed: it holds the dissector registration
+tables, which are always hot.
+
+Two other allocators are created on the same store because what they hold is
+per-capture rather than per-packet: the frame_data_sequence built by two-pass
+analysis (one frame_data per packet for the whole capture) and the fragment
+payload copies held by reassembly. The latter has its own arena rather than
+using file scope because those copies are dropped as soon as a reassembly
+completes; keeping them apart from state that lives until the capture closes
+means whole blocks go empty and can be given back, instead of the arena
+sitting at the sum of both high-water marks.
+
 4.2 Pool-Agnostic API
 
 One of the issues with emem was that the API (including the public data

@@ -1,0 +1,210 @@
+Spilling capture state to disk
+==============================
+
+This document describes why and how TShark can keep the dissection state of a
+capture file on disk instead of in RAM (the --spill-dir option), what it does
+not cover, and what the measured cost is. For the mechanics of the allocator
+itself see section 4.1.1 of README.wmem and the doxygen comments in
+wsutil/wmem/wmem_backing.h.
+
+1. The problem
+--------------
+
+Analysis state grows with the capture, and when it no longer fits in RAM the
+process dies. There is no partial result and no way to trade speed for
+capacity: g_malloc() fails, GLib aborts, and nothing is produced.
+
+Measured on a 4.1 GB / 9.53 M packet capture of real traffic, with every
+malloc-family allocation accounted:
+
+    peak heap, single pass                       9089 MB
+    peak heap, two-pass (-2)                    10184 MB
+
+Attributing that by workload (flow-complete subsets of the same traffic, and
+synthetic captures that vary one dimension at a time):
+
+    per TCP conversation                     ~4.0   KB
+    per packet, TCP sequence analysis        ~138   B
+    per packet, frame_data (two-pass only)    112   B
+    per packet, DNS-only traffic             ~600   B
+    per packet, HTTP-only traffic           ~1400   B
+    fixed floor (dissector registration)      ~91   MB
+
+So capacity was roughly RAM/1070 B per packet for a mixed workload. The
+existing mitigation, -M, periodically destroys the whole session: it bounds
+memory by discarding conversations, reassembly and all other per-capture
+state, which changes the results, and it is incompatible with -2.
+
+2. Goal
+-------
+
+Make the RAM requirement independent of the capture size, accepting that the
+run gets slower, and without changing any output. Specifically:
+
+  - identical results with and without the option, including taps and -2;
+  - no state discarded, unlike -M;
+  - no per-dissector changes, so the 3000+ dissectors are unaffected.
+
+Out of scope: live capture (state is bounded by the capture duration, not the
+file), the Qt GUI (random access needs more than this; see section 8), and
+parallel dissection (an orthogonal track).
+
+3. Architecture
+---------------
+
+A backing store (wmem_backing_t) is a single large shared mapping of a sparse
+temporary file. Allocators hand out regions of it instead of regions of the
+heap. Because the whole range is reserved and mapped once, addresses are
+stable for the life of the store, so nothing above the allocator - not the
+dissectors, not the data structures, not even the allocator's own chunk
+logic - has to know where the memory lives. Pages are resident only while in
+use; under memory pressure the kernel writes them to the backing file rather
+than failing the allocation.
+
+The block allocator took all of its OS memory from exactly three places
+(8 MB blocks, jumbo allocations, and their frees), so pointing it at a store
+is a policy change, not a new allocator: wmem_allocator_new_backed() passes a
+store down to wmem_block_allocator_init_backed(), and everything else about
+the allocator is unchanged. With a NULL store the behaviour is exactly as
+before.
+
+TShark creates one store from --spill-dir before epan_init() and attaches it
+to the allocators whose contents live as long as the capture file:
+
+    file scope            conversations, TCP analysis, per-packet proto data,
+                          streaming reassembly, reassembly tables and keys,
+                          reassembled buffers
+    addr_resolv_scope     name resolution caches
+    frame_data_sequence   the per-frame index built by two-pass analysis
+    fragment_data_scope   copies of individual fragment payloads
+
+Epan scope is never backed: it holds the dissector registration tables, which
+are always hot and are a fixed cost.
+
+4. Lifetime segregation
+-----------------------
+
+The last two arenas exist because a block allocator never returns a freed
+chunk to the OS - only whole blocks that have become entirely free, and only
+on garbage collection. Mixing allocations with different lifetimes in one
+arena therefore pins it at the sum of the high-water marks of all of them.
+
+Reassembly is the case where this bites. The fragment payload copies are
+dropped as soon as their reassembly completes, while the reassembled output
+and the bookkeeping live until the capture is closed. Putting both in file
+scope raised total footprint on an HTTP capture from 4804 MB to 8900 MB.
+Giving the fragment copies their own arena, collected every 4096 releases,
+brought it back to 4754 MB: blocks go empty, garbage collection returns them
+to the store, and the store releases the pages (and, where the platform
+supports hole punching, the disk blocks).
+
+This is the general rule for anything added later: an arena should hold
+objects with one lifetime.
+
+5. What is still on the heap
+----------------------------
+
+    dissector registration tables (epan scope)        ~91 MB, fixed
+    tap accumulators                                  grows with the number
+                                                      of conversations
+    GHashTable internals of the reassembly tables     grows with fragments
+    wiretap read buffers                              bounded per packet
+
+Measured residual on the 4.1 GB capture with -z conv,tcp: 141 MB, against
+8954 MB of state in the store.
+
+6. Correctness
+--------------
+
+The option changes where memory comes from, never what is computed, so the
+verification is equality of output rather than a new set of expectations:
+
+  - test/captures, 339 real captures: -V -x and -2 -V -x byte-identical with
+    and without --spill-dir;
+  - 9.53 M packet capture: -z conv,tcp output identical, 149018 rows;
+  - -T fields, -T json, -2 -T json, -z endpoints,ip identical;
+  - the project test suite (2089 tests) and reassemble_test unchanged;
+  - wmem_test runs its full allocator torture suite, including jumbo
+    allocations and the invariant checker, against a file-backed allocator
+    (/wmem/allocator/blk_backed) and asserts the store is fully reclaimed.
+
+The one behavioural subtlety is teardown order: a tvb wrapping reassembly
+data can be freed after file scope is gone, so the free callback checks
+wmem_in_scope() first.
+
+7. Cost
+-------
+
+Where the working set has locality, spilling is free; where it does not, the
+cost is page faults and writeback, because eviction is page-granular while
+the access pattern is flow-granular.
+
+    capture                            in RAM     spilled    peak heap spilled
+    real, 199 k packets                 0.84 s      0.81 s       187 MB
+    synthetic 2 M packets, 50 k flows   7.25 s      7.17 s        46 MB
+    synthetic 1 M packets, 500 k flows  4.16 s     14.2  s        47 MB
+    real, 9.53 M packets / 4.1 GB      38.8   s    708    s       141 MB
+
+(macOS 27 on APFS, 10 cores, 16 GB.)
+
+The third row is the adversarial case: 500 k flows touched round-robin, so no
+flow is ever in cache. MADV_RANDOM is what makes it tolerable - without it
+that run took 40.9 s, because readahead multiplied every fault.
+
+The last row is where it hurts, and it is much more an artifact of the host
+than of the design. The same capture, same code, in a Linux container on
+ext4 (8 cores, 10 GB):
+
+    real, 9.53 M packets / 4.1 GB      70.8   s    118    s
+
+1.7x rather than 18x, for 8954 MB of state. Writeback of randomly dirtied
+pages, not the spilling itself, is what differs. Expect the macOS figure to
+improve with the per-flow arenas in section 8, and do not take the 18x as the
+cost of the approach.
+
+8. Limits and next steps
+------------------------
+
+Capacity. With the heap term now flat, the limits are disk, the address space
+reserved by --spill-reserve (64 GB by default, and currently fatal rather
+than extensible when exhausted), tap accumulators for runs that use -z on
+very large captures, and 32-bit frame numbers.
+
+Speed. Page-granular eviction against flow-granular access is the remaining
+problem. The fix is to make file scope resolve to a per-conversation
+sub-arena, so a cold flow's state is page-contiguous and faults back as one
+unit; that also makes explicit LRU eviction of idle flows possible, which
+would subsume -M without discarding anything that is still reachable.
+
+GUI. The Qt interface is unchanged: it never calls
+wmem_set_capture_backing(). Enabling it there is a few lines, but random
+access to an arbitrary packet needs dissection state as of that packet, which
+needs the per-flow arenas above plus periodic checkpoints.
+
+9. Platform notes
+-----------------
+
+Linux releases pages with MADV_DONTNEED and punches the disk blocks out with
+fallocate(FALLOC_FL_PUNCH_HOLE); macOS uses fcntl(F_PUNCHHOLE). Note that
+FALLOC_FL_PUNCH_HOLE is declared in <linux/falloc.h>, not <fcntl.h>, and
+fallocate() itself needs _GNU_SOURCE - get either wrong and the hole punching
+silently compiles out while everything still works, just without returning
+disk blocks. Windows has no equivalent of the mapping scheme used here, so
+wmem_backing_file_new() fails there and --spill-dir reports the error.
+
+Resident set size is a misleading measure on both platforms: resident pages
+of the backing file count towards it even though they are evictable without
+swap. On macOS use "peak memory footprint" or the malloc interposer in
+test/benchmark; on Linux use a cgroup limit, which is also the clearest
+demonstration - under "docker run --memory=1g" the unmodified run is
+OOM-killed (SIGKILL) after 3 s having produced nothing, while the same run
+with --spill-dir completes with identical output and a resident set bounded
+by the limit.
+
+10. Reproducing the measurements
+--------------------------------
+
+test/benchmark contains the capture generators, the malloc-budget interposer
+and a Dockerfile for the Linux side, including the demonstrations that an
+unmodified run dies where a spilled run completes with identical output.
+See test/benchmark/README.md.
