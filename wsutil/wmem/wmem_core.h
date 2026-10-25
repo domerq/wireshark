@@ -19,6 +19,7 @@
 #include <ws_symbol_export.h>
 #include <ws_attributes.h>
 #include <ws_posix_compat.h>
+#include "wmem_backing.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -232,6 +233,23 @@ wmem_destroy_allocator(wmem_allocator_t *allocator);
 WS_DLL_PUBLIC
 wmem_allocator_t *
 wmem_allocator_new(const wmem_allocator_type_t type);
+
+/**
+ * @brief Create a new allocator of the given type on a backing store.
+ *
+ * Identical to wmem_allocator_new(), except that a block allocator will take
+ * the large regions it serves allocations out of from the given backing store
+ * instead of the system heap. Allocator types other than
+ * WMEM_ALLOCATOR_BLOCK ignore the backing store.
+ *
+ * @param type The type of allocator to create.
+ * @param backing The backing store to take memory from, or NULL for the heap.
+ * @return The new allocator.
+ */
+WS_DLL_PUBLIC
+wmem_allocator_t *
+wmem_allocator_new_backed(const wmem_allocator_type_t type,
+        wmem_backing_t *backing);
 
 /**
  * @brief Initialize the wmem subsystem.

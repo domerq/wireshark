@@ -56,6 +56,33 @@ WS_DLL_LOCAL
 void
 wmem_leave_file_scope(void);
 
+/* Capture-state backing store */
+
+/**
+ * @brief Make capture-lifetime state live in a backing store.
+ *
+ * Must be called before wmem_init_scopes(), i.e. before epan_init(). The
+ * file scope, which owns conversations, reassembly state, per-packet proto
+ * data and everything else that has to survive until the capture file is
+ * closed, is then served out of the given store instead of the heap. The
+ * caller owns the store and must keep it alive until after
+ * wmem_cleanup_scopes().
+ *
+ * @param backing The backing store, or NULL to use the heap.
+ */
+WS_DLL_PUBLIC
+void
+wmem_set_capture_backing(wmem_backing_t *backing);
+
+/**
+ * @brief Fetch the backing store set by wmem_set_capture_backing().
+ *
+ * @return The backing store, or NULL if capture state lives on the heap.
+ */
+WS_DLL_PUBLIC
+wmem_backing_t *
+wmem_capture_backing(void);
+
 /* Scope Management */
 
 /**

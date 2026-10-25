@@ -14,6 +14,7 @@
 #define __WMEM_ALLOCATOR_BLOCK_H__
 
 #include "wmem_core.h"
+#include "wmem_backing.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +35,21 @@ extern "C" {
  */
 void
 wmem_block_allocator_init(wmem_allocator_t *allocator);
+
+/**
+ * @brief Initialize a block-based memory allocator on a backing store.
+ *
+ * Like wmem_block_allocator_init(), except that the large regions the
+ * allocator serves allocations out of are taken from the given backing store
+ * rather than from the system heap. Chunk management is identical either way;
+ * only the source of the memory changes.
+ *
+ * @param allocator Pointer to the allocator structure to initialize.
+ * @param backing Backing store to take memory from, or NULL for the heap.
+ */
+void
+wmem_block_allocator_init_backed(wmem_allocator_t *allocator,
+        wmem_backing_t *backing);
 
 /**
  * @brief Verifies internal consistency of a wmem block allocator.

@@ -144,6 +144,8 @@
 #define LONGOPT_GLOBAL_PROFILE          LONGOPT_BASE_APPLICATION+10
 #define LONGOPT_COMPRESS                LONGOPT_BASE_APPLICATION+11
 #define LONGOPT_JSON_COMPACT            LONGOPT_BASE_APPLICATION+12
+#define LONGOPT_SPILL_DIR               LONGOPT_BASE_APPLICATION+13
+#define LONGOPT_SPILL_RESERVE           LONGOPT_BASE_APPLICATION+14
 
 capture_file cfile;
 
@@ -155,6 +157,10 @@ static frame_data prev_cap_frame;
 static bool perform_two_pass_analysis;
 static uint32_t epan_auto_reset_count;
 static bool epan_auto_reset;
+
+static const char *spill_dir;
+static uint64_t spill_reserve = UINT64_C(64) * 1024 * 1024 * 1024;
+static wmem_backing_t *capture_backing;
 
 static uint32_t selected_frame_number;
 
@@ -605,6 +611,11 @@ print_usage(FILE *output)
     fprintf(output, "  --temp-dir <directory>   write temporary files to this directory\n");
     fprintf(output, "                           (default: %s)\n", g_get_tmp_dir());
     fprintf(output, "  --compress <type>        compress the output file using the type compression format\n");
+    fprintf(output, "  --spill-dir <directory>  keep capture-lifetime dissection state in a temporary file\n");
+    fprintf(output, "                           in this directory instead of in RAM, so that captures\n");
+    fprintf(output, "                           whose state exceeds memory can still be analyzed\n");
+    fprintf(output, "  --spill-reserve <size>   address space to reserve for --spill-dir, in MB\n");
+    fprintf(output, "                           (def: %" PRIu64 "MB)\n", spill_reserve / (1024 * 1024));
     fprintf(output, "\n");
 
     ws_log_print_usage(output);
@@ -1100,6 +1111,8 @@ main(int argc, char *argv[])
         {"global-profile", ws_no_argument, NULL, LONGOPT_GLOBAL_PROFILE},
         {"compress", ws_required_argument, NULL, LONGOPT_COMPRESS},
         {"json-compact", ws_no_argument, NULL, LONGOPT_JSON_COMPACT},
+        {"spill-dir", ws_required_argument, NULL, LONGOPT_SPILL_DIR},
+        {"spill-reserve", ws_required_argument, NULL, LONGOPT_SPILL_RESERVE},
         {0, 0, 0, 0}
     };
     bool                 arg_error = false;
@@ -1324,6 +1337,23 @@ main(int argc, char *argv[])
             case 'X':
                 ex_opt_add(ws_optarg);
                 break;
+            case LONGOPT_SPILL_DIR:
+                spill_dir = ws_optarg;
+                break;
+            case LONGOPT_SPILL_RESERVE:
+            {
+                uint64_t spill_reserve_mb;
+
+                if (!ws_strtou64(ws_optarg, NULL, &spill_reserve_mb) ||
+                        spill_reserve_mb == 0) {
+                    cmdarg_err("\"%s\" isn't a valid reserve size in MB",
+                            ws_optarg);
+                    exit_status = WS_EXIT_INVALID_OPTION;
+                    goto clean_exit;
+                }
+                spill_reserve = spill_reserve_mb * 1024 * 1024;
+                break;
+            }
             case 'h':
             case 'v':
                 is_capturing = false;
@@ -1379,6 +1409,22 @@ main(int argc, char *argv[])
      */
     application_file_extensions(&file_extensions, &num_extensions);
     wtap_init(true, application_configuration_environment_prefix(), file_extensions, num_extensions);
+
+    if (spill_dir != NULL) {
+        char *spill_err;
+
+        capture_backing = wmem_backing_file_new(spill_dir, spill_reserve,
+                &spill_err);
+        if (capture_backing == NULL) {
+            cmdarg_err("Can't spill dissection state to \"%s\": %s",
+                    spill_dir, spill_err);
+            g_free(spill_err);
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        /* Must happen before epan_init() creates the scopes. */
+        wmem_set_capture_backing(capture_backing);
+    }
 
     /* Register all dissectors; we must do this before checking for the
        "-G" flag, as the "-G" flag dumps information registered by the
@@ -1855,6 +1901,10 @@ main(int argc, char *argv[])
                 /* already processed; just ignore it now */
                 break;
             case 'X':
+                /* already processed; just ignore it now */
+                break;
+            case LONGOPT_SPILL_DIR:
+            case LONGOPT_SPILL_RESERVE:
                 /* already processed; just ignore it now */
                 break;
             case 'Y':
@@ -2982,12 +3032,23 @@ main(int argc, char *argv[])
         }
     }
 
+    if (capture_backing != NULL) {
+        fprintf(stderr, "spilled dissection state: %" PRIu64 " MB peak, "
+                "%" PRIu64 " MB live at exit (%s)\n",
+                wmem_backing_bytes_high_water(capture_backing) / (1024 * 1024),
+                wmem_backing_bytes_live(capture_backing) / (1024 * 1024),
+                wmem_backing_path(capture_backing));
+    }
+
     /* Memory cleanup */
     reset_tap_listeners();
     funnel_dump_all_text_windows();
     epan_free(cfile.epan);
     epan_cleanup();
     extcap_cleanup();
+
+    wmem_backing_destroy(capture_backing);
+    capture_backing = NULL;
 
     output_fields_free(output_fields);
     output_fields = NULL;
