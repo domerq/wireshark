@@ -146,6 +146,7 @@
 #define LONGOPT_JSON_COMPACT            LONGOPT_BASE_APPLICATION+12
 #define LONGOPT_SPILL_DIR               LONGOPT_BASE_APPLICATION+13
 #define LONGOPT_SPILL_RESERVE           LONGOPT_BASE_APPLICATION+14
+#define LONGOPT_SPILL_AFTER             LONGOPT_BASE_APPLICATION+15
 
 capture_file cfile;
 
@@ -160,6 +161,7 @@ static bool epan_auto_reset;
 
 static const char *spill_dir;
 static uint64_t spill_reserve = UINT64_C(64) * 1024 * 1024 * 1024;
+static uint64_t spill_after = UINT64_C(2) * 1024 * 1024 * 1024;
 static wmem_backing_t *capture_backing;
 
 static uint32_t selected_frame_number;
@@ -614,6 +616,8 @@ print_usage(FILE *output)
     fprintf(output, "  --spill-dir <directory>  keep capture-lifetime dissection state in a temporary file\n");
     fprintf(output, "                           in this directory instead of in RAM, so that captures\n");
     fprintf(output, "                           whose state exceeds memory can still be analyzed\n");
+    fprintf(output, "  --spill-after <size>     dissection state to keep in RAM before spilling, in MB\n");
+    fprintf(output, "                           (def: %" PRIu64 "MB; 0 spills everything)\n", spill_after / (1024 * 1024));
     fprintf(output, "  --spill-reserve <size>   address space to reserve for --spill-dir, in MB\n");
     fprintf(output, "                           (def: %" PRIu64 "MB)\n", spill_reserve / (1024 * 1024));
     fprintf(output, "\n");
@@ -1113,6 +1117,7 @@ main(int argc, char *argv[])
         {"json-compact", ws_no_argument, NULL, LONGOPT_JSON_COMPACT},
         {"spill-dir", ws_required_argument, NULL, LONGOPT_SPILL_DIR},
         {"spill-reserve", ws_required_argument, NULL, LONGOPT_SPILL_RESERVE},
+        {"spill-after", ws_required_argument, NULL, LONGOPT_SPILL_AFTER},
         {0, 0, 0, 0}
     };
     bool                 arg_error = false;
@@ -1354,6 +1359,19 @@ main(int argc, char *argv[])
                 spill_reserve = spill_reserve_mb * 1024 * 1024;
                 break;
             }
+            case LONGOPT_SPILL_AFTER:
+            {
+                uint64_t spill_after_mb;
+
+                if (!ws_strtou64(ws_optarg, NULL, &spill_after_mb)) {
+                    cmdarg_err("\"%s\" isn't a valid amount of memory in MB",
+                            ws_optarg);
+                    exit_status = WS_EXIT_INVALID_OPTION;
+                    goto clean_exit;
+                }
+                spill_after = spill_after_mb * 1024 * 1024;
+                break;
+            }
             case 'h':
             case 'v':
                 is_capturing = false;
@@ -1414,7 +1432,7 @@ main(int argc, char *argv[])
         char *spill_err;
 
         capture_backing = wmem_backing_file_new(spill_dir, spill_reserve,
-                &spill_err);
+                spill_after, &spill_err);
         if (capture_backing == NULL) {
             cmdarg_err("Can't spill dissection state to \"%s\": %s",
                     spill_dir, spill_err);
@@ -1905,6 +1923,7 @@ main(int argc, char *argv[])
                 break;
             case LONGOPT_SPILL_DIR:
             case LONGOPT_SPILL_RESERVE:
+            case LONGOPT_SPILL_AFTER:
                 /* already processed; just ignore it now */
                 break;
             case 'Y':
@@ -3033,10 +3052,10 @@ main(int argc, char *argv[])
     }
 
     if (capture_backing != NULL) {
-        fprintf(stderr, "spilled dissection state: %" PRIu64 " MB peak, "
-                "%" PRIu64 " MB live at exit (%s)\n",
+        fprintf(stderr, "dissection state: %" PRIu64 " MB peak in RAM, "
+                "%" PRIu64 " MB peak spilled to %s\n",
+                wmem_backing_bytes_in_ram(capture_backing) / (1024 * 1024),
                 wmem_backing_bytes_high_water(capture_backing) / (1024 * 1024),
-                wmem_backing_bytes_live(capture_backing) / (1024 * 1024),
                 wmem_backing_path(capture_backing));
     }
 

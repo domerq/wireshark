@@ -41,7 +41,6 @@ extern "C" {
 struct _wmem_backing_t;
 /** An opaque type representing one backing store. */
 typedef struct _wmem_backing_t wmem_backing_t;
-
 /**
  * @brief Create a file-backed memory store.
  *
@@ -49,18 +48,26 @@ typedef struct _wmem_backing_t wmem_backing_t;
  * file. The file is unlinked immediately, so it occupies no name in the
  * filesystem and is reclaimed even if the process dies abnormally.
  *
+ * Regions are served from the heap until @p threshold bytes are outstanding
+ * and from the file after that, so analysis whose state fits in RAM costs
+ * nothing and only the excess pays for the disk. A threshold of 0 sends
+ * everything to the file.
+ *
  * @param dir Directory to create the temporary file in, or NULL for the
  *            system temporary directory.
  * @param reserve Size of the address range to reserve, in bytes. This is an
  *            upper bound on the amount of memory the store can hand out, not
  *            an amount of memory or disk that is consumed up front.
+ * @param threshold Bytes to keep in RAM before spilling.
  * @param err If creation fails, set to a newly allocated error string that
  *            the caller must g_free().
  * @return The new backing store, or NULL on failure.
  */
 WS_DLL_PUBLIC
 wmem_backing_t *
-wmem_backing_file_new(const char *dir, uint64_t reserve, char **err);
+wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
+        char **err);
+
 
 /**
  * @brief Destroy a backing store, unmapping all memory it handed out.
@@ -128,6 +135,16 @@ wmem_backing_bytes_high_water(const wmem_backing_t *backing);
 WS_DLL_PUBLIC
 uint64_t
 wmem_backing_bytes_reserved(const wmem_backing_t *backing);
+
+/** @brief Largest number of bytes ever held in RAM below the watermark. */
+WS_DLL_PUBLIC
+uint64_t
+wmem_backing_bytes_in_ram(const wmem_backing_t *backing);
+
+/** @brief The watermark the store was created with, in bytes. */
+WS_DLL_PUBLIC
+uint64_t
+wmem_backing_threshold(const wmem_backing_t *backing);
 
 /** @brief Path the backing file was created at (it is already unlinked). */
 WS_DLL_PUBLIC
