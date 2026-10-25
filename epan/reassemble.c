@@ -21,6 +21,95 @@
 #include <wsutil/ws_assert.h>
 
 /*
+ * Reassembly state - the hash keys, the per-fragment bookkeeping and the
+ * reassembled buffers - has to live as long as the capture file is open, so
+ * it comes out of file scope and follows it onto disk when a backing store is
+ * configured (see wsutil/wmem/wmem_backing.h).
+ *
+ * The copies of the individual fragment payloads are different: they are
+ * dropped as soon as the reassembly they belong to completes. Mixing them in
+ * with state that lives until the capture is closed would leave the arena at
+ * the high-water mark of both, so they get an arena of their own, which is
+ * garbage-collected as fragments are released and gives whole blocks back.
+ */
+
+static wmem_allocator_t *fragment_data_scope;
+static unsigned fragment_data_frees;
+
+/* How many fragment payloads to release before looking for blocks that have
+ * become empty. Low enough to keep the arena tight, high enough that the scan
+ * over the block list is noise. */
+#define FRAGMENT_DATA_GC_INTERVAL 4096
+
+static bool
+fragment_data_scope_gone(wmem_allocator_t *allocator _U_,
+			 wmem_cb_event_t event _U_, void *user_data _U_)
+{
+	/* The capture is being closed; the fragment payloads go with it. */
+	wmem_destroy_allocator(fragment_data_scope);
+	fragment_data_scope = NULL;
+	fragment_data_frees = 0;
+
+	/* Don't stay registered; a new arena registers its own callback. */
+	return false;
+}
+
+static wmem_allocator_t *
+fragment_data_pool(void)
+{
+	if (fragment_data_scope == NULL) {
+		fragment_data_scope = wmem_allocator_new_backed(
+			WMEM_ALLOCATOR_BLOCK, wmem_capture_backing());
+		wmem_register_callback(wmem_file_scope(),
+				       fragment_data_scope_gone, NULL);
+	}
+	return fragment_data_scope;
+}
+
+static void
+reassembly_data_free(void *data)
+{
+	/* This runs when the tvb wrapping the data is freed, which can happen
+	 * after the file scope itself has been torn down; then the memory is
+	 * gone already. */
+	if (wmem_in_scope(wmem_file_scope()))
+		wmem_free(wmem_file_scope(), data);
+}
+
+static void
+fragment_data_free(void *data)
+{
+	if (fragment_data_scope == NULL)
+		return;
+
+	wmem_free(fragment_data_scope, data);
+
+	if (++fragment_data_frees >= FRAGMENT_DATA_GC_INTERVAL) {
+		fragment_data_frees = 0;
+		wmem_gc(fragment_data_scope);
+	}
+}
+
+/* tvb_clone_offset_len(), but with the copy owned by the given arena. */
+static tvbuff_t *
+reassembly_clone_tvb(wmem_allocator_t *scope, void (*free_cb)(void *),
+		     tvbuff_t *tvb, unsigned offset, unsigned len)
+{
+	tvbuff_t *cloned_tvb;
+	uint8_t  *data;
+
+	DISSECTOR_ASSERT(tvb_bytes_exist(tvb, offset, len));
+
+	data = (uint8_t *)wmem_alloc(scope, len);
+	tvb_memcpy(tvb, data, offset, len);
+
+	cloned_tvb = tvb_new_real_data(data, len, len);
+	tvb_set_free_cb(cloned_tvb, free_cb);
+
+	return cloned_tvb;
+}
+
+/*
  * Functions for reassembly tables where the endpoint addresses, and a
  * fragment ID, are used as the key.
  */
@@ -83,7 +172,7 @@ static void *
 fragment_addresses_temporary_key(const packet_info *pinfo, const uint32_t id,
 				 const void *data _U_)
 {
-	fragment_addresses_key *key = g_slice_new(fragment_addresses_key);
+	fragment_addresses_key *key = wmem_new(wmem_file_scope(), fragment_addresses_key);
 
 	/*
 	 * Do a shallow copy of the addresses.
@@ -103,13 +192,13 @@ static void *
 fragment_addresses_persistent_key(const packet_info *pinfo, const uint32_t id,
 				  const void *data _U_)
 {
-	fragment_addresses_key *key = g_slice_new(fragment_addresses_key);
+	fragment_addresses_key *key = wmem_new(wmem_file_scope(), fragment_addresses_key);
 
 	/*
 	 * Do a deep copy of the addresses.
 	 */
-	copy_address(&key->src, &pinfo->src);
-	copy_address(&key->dst, &pinfo->dst);
+	copy_address_wmem(wmem_file_scope(), &key->src, &pinfo->src);
+	copy_address_wmem(wmem_file_scope(), &key->dst, &pinfo->dst);
 	key->id = id;
 
 	return (void *)key;
@@ -119,7 +208,7 @@ static void
 fragment_addresses_free_temporary_key(void *ptr)
 {
 	fragment_addresses_key *key = (fragment_addresses_key *)ptr;
-	g_slice_free(fragment_addresses_key, key);
+	wmem_free(wmem_file_scope(), key);
 }
 
 static void
@@ -131,10 +220,10 @@ fragment_addresses_free_persistent_key(void *ptr)
 		/*
 		 * Free up the copies of the addresses from the old key.
 		 */
-		free_address(&key->src);
-		free_address(&key->dst);
+		free_address_wmem(wmem_file_scope(), &key->src);
+		free_address_wmem(wmem_file_scope(), &key->dst);
 
-		g_slice_free(fragment_addresses_key, key);
+		wmem_free(wmem_file_scope(), key);
 	}
 }
 
@@ -215,7 +304,7 @@ static void *
 fragment_addresses_ports_temporary_key(const packet_info *pinfo, const uint32_t id,
 				       const void *data _U_)
 {
-	fragment_addresses_ports_key *key = g_slice_new(fragment_addresses_ports_key);
+	fragment_addresses_ports_key *key = wmem_new(wmem_file_scope(), fragment_addresses_ports_key);
 
 	/*
 	 * Do a shallow copy of the addresses.
@@ -237,13 +326,13 @@ static void *
 fragment_addresses_ports_persistent_key(const packet_info *pinfo,
 					const uint32_t id, const void *data _U_)
 {
-	fragment_addresses_ports_key *key = g_slice_new(fragment_addresses_ports_key);
+	fragment_addresses_ports_key *key = wmem_new(wmem_file_scope(), fragment_addresses_ports_key);
 
 	/*
 	 * Do a deep copy of the addresses.
 	 */
-	copy_address(&key->src_addr, &pinfo->src);
-	copy_address(&key->dst_addr, &pinfo->dst);
+	copy_address_wmem(wmem_file_scope(), &key->src_addr, &pinfo->src);
+	copy_address_wmem(wmem_file_scope(), &key->dst_addr, &pinfo->dst);
 	key->src_port = pinfo->srcport;
 	key->dst_port = pinfo->destport;
 	key->id = id;
@@ -255,7 +344,7 @@ static void
 fragment_addresses_ports_free_temporary_key(void *ptr)
 {
 	fragment_addresses_ports_key *key = (fragment_addresses_ports_key *)ptr;
-	g_slice_free(fragment_addresses_ports_key, key);
+	wmem_free(wmem_file_scope(), key);
 }
 
 static void
@@ -267,10 +356,10 @@ fragment_addresses_ports_free_persistent_key(void *ptr)
 		/*
 		 * Free up the copies of the addresses from the old key.
 		 */
-		free_address(&key->src_addr);
-		free_address(&key->dst_addr);
+		free_address_wmem(wmem_file_scope(), &key->src_addr);
+		free_address_wmem(wmem_file_scope(), &key->dst_addr);
 
-		g_slice_free(fragment_addresses_ports_key, key);
+		wmem_free(wmem_file_scope(), key);
 	}
 }
 
@@ -313,7 +402,7 @@ reassembled_hash(const void *k)
 static void
 reassembled_key_free(void *ptr)
 {
-	g_slice_free(reassembled_key, (reassembled_key *)ptr);
+	wmem_free(wmem_file_scope(), ptr);
 }
 
 /* --------------fragment_item functions ----------- */
@@ -322,7 +411,7 @@ new_fragment_item(uint32_t frame, uint32_t offset, uint32_t len)
 {
 	fragment_item *fd;
 
-	fd = g_slice_new(fragment_item);
+	fd = wmem_new(wmem_file_scope(), fragment_item);
 	fd->next = NULL;
 	fd->flags = 0;
 	fd->frame = frame;
@@ -353,7 +442,7 @@ fragment_item_free(fragment_item *fd_i)
 {
 	fragment_item *fd_next = fd_i->next;
 	fragment_item_free_tvb(fd_i);
-	g_slice_free(fragment_item, fd_i);
+	wmem_free(wmem_file_scope(), fd_i);
 	return fd_next;
 }
 
@@ -365,7 +454,7 @@ static fragment_head *new_head(const uint32_t flags)
 	* 'datalen' then we don't have to change the head of the list
 	* even if we want to keep it sorted
 	*/
-	fd_head=g_slice_new0(fragment_head);
+	fd_head=wmem_new0(wmem_file_scope(), fragment_head);
 
 	fd_head->flags=flags;
 	return fd_head;
@@ -388,7 +477,7 @@ free_fd_head(fragment_head *fd_head)
 	while (fd_i != NULL) {
 		fd_i = fragment_item_free(fd_i);
 	}
-	g_slice_free(fragment_head, fd_head);
+	wmem_free(wmem_file_scope(), fd_head);
 }
 
 static void
@@ -651,7 +740,7 @@ fragment_delete(reassembly_table *table, const packet_info *pinfo,
 	while (fd != NULL) {
 		fd = fragment_item_free(fd);
 	}
-	g_slice_free(fragment_head, fd_head);
+	wmem_free(wmem_file_scope(), fd_head);
 	g_hash_table_remove(table->fragment_table, key);
 
 	return fd_tvb_data;
@@ -916,8 +1005,8 @@ fragment_truncate(reassembly_table *table, const packet_info *pinfo,
 	DISSECTOR_ASSERT(fd_head->datalen > tot_len);
 
 	old_tvb_data=fd_head->tvb_data;
-	fd_head->tvb_data = tvb_clone_offset_len(old_tvb_data, 0, tot_len);
-	tvb_set_free_cb(fd_head->tvb_data, g_free);
+	fd_head->tvb_data = reassembly_clone_tvb(wmem_file_scope(),
+		reassembly_data_free, old_tvb_data, 0, tot_len);
 
 	if (old_tvb_data)
 		tvb_add_to_chain(fd_head->tvb_data, old_tvb_data);
@@ -1043,7 +1132,7 @@ fragment_reassembled(reassembly_table *table, fragment_head *fd_head,
 		 * This was not fragmented, so there's no fragment
 		 * table; just hash it using the current frame number.
 		 */
-		new_key = g_slice_new(reassembled_key);
+		new_key = wmem_new(wmem_file_scope(), reassembled_key);
 		new_key->frame = pinfo->num;
 		new_key->id = id;
 		reassembled_table_insert(table->reassembled_table, new_key, fd_head);
@@ -1052,7 +1141,7 @@ fragment_reassembled(reassembly_table *table, fragment_head *fd_head,
 		 * Hash it with the frame numbers for all the frames.
 		 */
 		for (fd = fd_head->next; fd != NULL; fd = fd->next){
-			new_key = g_slice_new(reassembled_key);
+			new_key = wmem_new(wmem_file_scope(), reassembled_key);
 			new_key->frame = fd->frame;
 			new_key->id = id;
 			reassembled_table_insert(table->reassembled_table, new_key, fd_head);
@@ -1081,7 +1170,7 @@ fragment_reassembled_single(reassembly_table *table, fragment_head *fd_head,
 		 * This was not fragmented, so there's no fragment
 		 * table; just hash it using the current frame number.
 		 */
-		new_key = g_slice_new(reassembled_key);
+		new_key = wmem_new(wmem_file_scope(), reassembled_key);
 		new_key->frame = pinfo->num;
 		new_key->id = id;
 		reassembled_table_insert(table->reassembled_table, new_key, fd_head);
@@ -1090,7 +1179,7 @@ fragment_reassembled_single(reassembly_table *table, fragment_head *fd_head,
 		 * Hash it with the frame numbers for all the frames.
 		 */
 		for (fd = fd_head->next; fd != NULL; fd = fd->next){
-			new_key = g_slice_new(reassembled_key);
+			new_key = wmem_new(wmem_file_scope(), reassembled_key);
 			new_key->frame = fd->frame;
 			new_key->id = id + fd->offset;
 			reassembled_table_insert(table->reassembled_table, new_key, fd_head);
@@ -1244,7 +1333,7 @@ fragment_add_work(fragment_head *fd_head, tvbuff_t *tvb, const int offset,
 				 * we'll run past the end of a buffer sooner
 				 * or later).
 				 */
-				g_slice_free(fragment_item, fd);
+				wmem_free(wmem_file_scope(), fd);
 
 				/*
 				 * This is an attempt to add a fragment to a
@@ -1352,10 +1441,11 @@ fragment_add_work(fragment_head *fd_head, tvbuff_t *tvb, const int offset,
 	 * Save all payload in a buffer until we can defragment.
 	 */
 	if (!tvb_bytes_exist(tvb, offset, fd->len)) {
-		g_slice_free(fragment_item, fd);
+		wmem_free(wmem_file_scope(), fd);
 		THROW(BoundsError);
 	}
-	fd->tvb_data = tvb_clone_offset_len(tvb, offset, fd->len);
+	fd->tvb_data = reassembly_clone_tvb(fragment_data_pool(),
+		fragment_data_free, tvb, offset, fd->len);
 	LINK_FRAG(fd_head,fd);
 
 
@@ -1381,9 +1471,9 @@ fragment_add_work(fragment_head *fd_head, tvbuff_t *tvb, const int offset,
 	 */
 	/* store old data just in case */
 	old_tvb_data=fd_head->tvb_data;
-	data = (uint8_t *) g_malloc(fd_head->datalen);
+	data = (uint8_t *) wmem_alloc(wmem_file_scope(), fd_head->datalen);
 	fd_head->tvb_data = tvb_new_real_data(data, fd_head->datalen, fd_head->datalen);
-	tvb_set_free_cb(fd_head->tvb_data, g_free);
+	tvb_set_free_cb(fd_head->tvb_data, reassembly_data_free);
 
 	dfpos = old_tvb_data ? tvb_captured_length(old_tvb_data) : 0;
 	if (dfpos) {
@@ -1813,7 +1903,7 @@ fragment_add_check_common(reassembly_table *table, tvbuff_t *tvb, const int offs
 		fd_head = (fragment_head *)g_hash_table_lookup(table->reassembled_table, &reass_key);
 		if (fd_head != NULL) {
 			/* Found completely reassembled packet, hash it with current frame number */
-			reassembled_key *new_key = g_slice_new(reassembled_key);
+			reassembled_key *new_key = wmem_new(wmem_file_scope(), reassembled_key);
 			new_key->frame = pinfo->num;
 			new_key->id = id;
 			reassembled_table_insert(table->reassembled_table, new_key, fd_head);
@@ -1959,9 +2049,9 @@ fragment_defragment_and_free (fragment_head *fd_head, const packet_info *pinfo)
 
 	/* store old data in case the fd_i->data pointers refer to it */
 	old_tvb_data=fd_head->tvb_data;
-	data = (uint8_t *) g_malloc(size);
+	data = (uint8_t *) wmem_alloc(wmem_file_scope(), size);
 	fd_head->tvb_data = tvb_new_real_data(data, size, size);
-	tvb_set_free_cb(fd_head->tvb_data, g_free);
+	tvb_set_free_cb(fd_head->tvb_data, reassembly_data_free);
 	fd_head->len = size;		/* record size for caller	*/
 
 	if (old_tvb_data) {
@@ -2190,11 +2280,12 @@ fragment_add_seq_work(fragment_head *fd_head, tvbuff_t *tvb, const int offset,
 		if (!tvb_bytes_exist(tvb, offset, fd->len)) {
 			/* abort if we didn't capture the entire fragment due
 			 * to a too-short snapshot length */
-			g_slice_free(fragment_item, fd);
+			wmem_free(wmem_file_scope(), fd);
 			return false;
 		}
 
-		fd->tvb_data = tvb_clone_offset_len(tvb, offset, fd->len);
+		fd->tvb_data = reassembly_clone_tvb(fragment_data_pool(),
+			fragment_data_free, tvb, offset, fd->len);
 	}
 	LINK_FRAG(fd_head,fd);
 
@@ -2887,7 +2978,7 @@ fragment_end_seq_next(reassembly_table *table, const packet_info *pinfo,
 		 */
 		fragment_reassembled(table, fd_head, pinfo, id);
 		if (fd_head->next != NULL) {
-			new_key = g_slice_new(reassembled_key);
+			new_key = wmem_new(wmem_file_scope(), reassembled_key);
 			new_key->frame = pinfo->num;
 			new_key->id = id;
 			reassembled_table_insert(table->reassembled_table, new_key, fd_head);

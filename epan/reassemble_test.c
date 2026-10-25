@@ -3253,6 +3253,10 @@ main(int argc _U_, char **argv _U_)
         test_fragment_add_check_duplicate_conflict,
     };
 
+    /* Reassembly state is allocated in file scope, so the tables need one. */
+    wmem_init_scopes();
+    wmem_enter_scope(wmem_file_scope());
+
     /* a tvbuff for testing with */
     data = (uint8_t *)g_malloc(DATA_LEN);
     /* make sure it's full of stuff */
@@ -3287,6 +3291,9 @@ main(int argc _U_, char **argv _U_)
     tvb = NULL;
     g_free(data);
     data = NULL;
+
+    wmem_leave_scope(wmem_file_scope());
+    wmem_cleanup_scopes();
 
     printf(failure?"FAILURE\n":"SUCCESS\n");
     return failure;
