@@ -355,8 +355,10 @@ wmem_test_allocator_block_backed(void)
 {
     char *err = NULL;
 
+    /* Threshold 0: every region comes from the file, which is what this
+     * test is here to exercise. */
     test_backing = wmem_backing_file_new(NULL,
-            UINT64_C(1) * 1024 * 1024 * 1024, &err);
+            UINT64_C(1) * 1024 * 1024 * 1024, 0, &err);
     if (test_backing == NULL) {
         g_test_skip(err);
         g_free(err);

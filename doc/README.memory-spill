@@ -135,15 +135,40 @@ wmem_in_scope() first.
 7. Cost
 -------
 
-Where the working set has locality, spilling is free; where it does not, the
-cost is page faults and writeback, because eviction is page-granular while
-the access pattern is flow-granular.
+Nothing is written while state is under the --spill-after watermark, so a
+capture that fits in RAM is unaffected. Past it, the cost is page faults and
+writeback on the part that went to disk, because eviction is page-granular
+while the access pattern is flow-granular. The same 4.1 GB capture (9.53 M
+packets, 8954 MB of state, -z conv,tcp) at different watermarks:
+
+    watermark      in RAM    spilled     wall
+    no spilling        -          -       36 s
+    16384 MB      8954 MB       0 MB      36 s
+     6144 MB      6136 MB    2818 MB      47 s
+     2048 MB      2045 MB    6909 MB     431 s
+        0 MB           0    8954 MB      698 s
+
+So the penalty tracks how much is on disk, and the watermark is the knob that
+trades speed for capacity rather than a switch that makes everything slow.
+
+Flow-sharded parallelism helps more than it looks like it should, because it
+shrinks the working set each process touches. Four workers on flow-disjoint
+shards of the same capture, each holding ~2.3 GB of state:
+
+    4 workers, no spilling                      11 s
+    4 workers, watermark 4096 MB (nothing spills) 11 s
+    4 workers, watermark 0 (everything spills)  23 s
+
+23 s against 698 s for one process spilling the same total state: one process
+randomly touching a 9 GB arena misses cache constantly, four touching 2.3 GB
+arenas do not.
+
+Smaller captures and other shapes, at watermark 0 (worst case):
 
     capture                            in RAM     spilled    peak heap spilled
     real, 199 k packets                 0.84 s      0.81 s       187 MB
     synthetic 2 M packets, 50 k flows   7.25 s      7.17 s        46 MB
     synthetic 1 M packets, 500 k flows  4.16 s     14.2  s        47 MB
-    real, 9.53 M packets / 4.1 GB      38.8   s    708    s       141 MB
 
 (macOS 27 on APFS, 10 cores, 16 GB.)
 
@@ -151,16 +176,13 @@ The third row is the adversarial case: 500 k flows touched round-robin, so no
 flow is ever in cache. MADV_RANDOM is what makes it tolerable - without it
 that run took 40.9 s, because readahead multiplied every fault.
 
-The last row is where it hurts, and it is much more an artifact of the host
-than of the design. The same capture, same code, in a Linux container on
-ext4 (8 cores, 10 GB):
+Host matters as much as workload. The 9.53 M packet capture at watermark 0,
+same code, in a Linux container on ext4 (8 cores, 10 GB):
 
     real, 9.53 M packets / 4.1 GB      70.8   s    118    s
 
-1.7x rather than 18x, for 8954 MB of state. Writeback of randomly dirtied
-pages, not the spilling itself, is what differs. Expect the macOS figure to
-improve with the per-flow arenas in section 8, and do not take the 18x as the
-cost of the approach.
+1.7x rather than 19x. Writeback of randomly dirtied pages, not the spilling
+itself, is what differs between the two systems.
 
 8. Limits and next steps
 ------------------------

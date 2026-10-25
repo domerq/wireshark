@@ -42,15 +42,24 @@ struct _wmem_backing_t {
     uint8_t    *base;      /* start of the mapped range */
     uint64_t    reserve;   /* size of the mapped range */
     uint64_t    bump;      /* offset of the first never-used byte */
-    uint64_t    live;      /* bytes currently handed out */
+    uint64_t    live;      /* bytes currently handed out from the file */
     uint64_t    high_water;
     size_t      pagesize;
+
+    /* Regions are served from the heap until this much is outstanding, and
+     * from the file after that. Analysis that fits in memory therefore costs
+     * nothing, and only the excess pays for the disk. */
+    uint64_t    threshold;
+    uint64_t    heap_live;
+    uint64_t    heap_high_water;
 
     /* region pointer -> region size. Frees come in without a size, and we
      * want regions to stay page-aligned, so the sizes live beside the data
      * rather than in a header. One entry per multi-megabyte region makes
-     * this metadata negligible. */
+     * this metadata negligible. The heap map doubles as the record of which
+     * source a region came from. */
     GHashTable *sizes;
+    GHashTable *heap_sizes;
 
     /* region size -> GPtrArray of free regions of exactly that size. The
      * block allocator asks for the same size nearly every time, so exact-fit
@@ -104,10 +113,11 @@ wmem_backing_release(wmem_backing_t *backing, void *ptr, size_t size)
 }
 
 wmem_backing_t *
-wmem_backing_file_new(const char *dir, uint64_t reserve, char **err)
+wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
+        char **err)
 {
 #ifdef _WIN32
-    (void)dir; (void)reserve;
+    (void)dir; (void)reserve; (void)threshold;
     *err = g_strdup("disk-backed memory is not supported on this platform");
     return NULL;
 #else
@@ -171,8 +181,10 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, char **err)
     backing->path       = path;
     backing->base       = (uint8_t *)base;
     backing->reserve    = reserve;
+    backing->threshold  = threshold;
     backing->pagesize   = pagesize;
     backing->sizes      = g_hash_table_new(g_direct_hash, g_direct_equal);
+    backing->heap_sizes = g_hash_table_new(g_direct_hash, g_direct_equal);
     backing->free_lists = g_hash_table_new_full(g_direct_hash, g_direct_equal,
             NULL, (GDestroyNotify)g_ptr_array_unref);
 
@@ -193,19 +205,18 @@ wmem_backing_destroy(wmem_backing_t *backing)
 #endif
 
     g_hash_table_destroy(backing->sizes);
+    g_hash_table_destroy(backing->heap_sizes);
     g_hash_table_destroy(backing->free_lists);
     g_free(backing->path);
     g_free(backing);
 }
 
-void *
-wmem_backing_alloc(wmem_backing_t *backing, size_t size)
+/* Hand out a region from the file. */
+static void *
+wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
 {
     GPtrArray *bucket;
     void      *ptr = NULL;
-    size_t     want;
-
-    want = (size_t)wmem_backing_round_up(size, backing->pagesize);
 
     bucket = (GPtrArray *)g_hash_table_lookup(backing->free_lists,
             GSIZE_TO_POINTER(want));
@@ -232,6 +243,29 @@ wmem_backing_alloc(wmem_backing_t *backing, size_t size)
     return ptr;
 }
 
+void *
+wmem_backing_alloc(wmem_backing_t *backing, size_t size)
+{
+    size_t want;
+    void  *ptr;
+
+    want = (size_t)wmem_backing_round_up(size, backing->pagesize);
+
+    /* Below the watermark the memory is ordinary heap memory, so a capture
+     * whose state fits in RAM runs exactly as it would without a store. */
+    if (backing->heap_live + want <= backing->threshold) {
+        ptr = g_malloc(want);
+        g_hash_table_insert(backing->heap_sizes, ptr, GSIZE_TO_POINTER(want));
+        backing->heap_live += want;
+        if (backing->heap_live > backing->heap_high_water) {
+            backing->heap_high_water = backing->heap_live;
+        }
+        return ptr;
+    }
+
+    return wmem_backing_alloc_mapped(backing, want);
+}
+
 void
 wmem_backing_free(wmem_backing_t *backing, void *ptr)
 {
@@ -239,6 +273,14 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
     size_t     size;
 
     if (ptr == NULL) {
+        return;
+    }
+
+    size = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->heap_sizes, ptr));
+    if (size != 0) {
+        g_hash_table_remove(backing->heap_sizes, ptr);
+        backing->heap_live -= size;
+        g_free(ptr);
         return;
     }
 
@@ -270,10 +312,32 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
         return wmem_backing_alloc(backing, size);
     }
 
+    want = (size_t)wmem_backing_round_up(size, backing->pagesize);
+
+    old = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->heap_sizes, ptr));
+    if (old != 0) {
+        /* Still in RAM. Keep it there if it fits under the watermark,
+         * otherwise this is where it moves to the file. */
+        if (backing->heap_live - old + want <= backing->threshold) {
+            new_ptr = g_realloc(ptr, want);
+            g_hash_table_remove(backing->heap_sizes, ptr);
+            g_hash_table_insert(backing->heap_sizes, new_ptr,
+                    GSIZE_TO_POINTER(want));
+            backing->heap_live += want - old;
+            if (backing->heap_live > backing->heap_high_water) {
+                backing->heap_high_water = backing->heap_live;
+            }
+            return new_ptr;
+        }
+
+        new_ptr = wmem_backing_alloc_mapped(backing, want);
+        memcpy(new_ptr, ptr, old < want ? old : want);
+        wmem_backing_free(backing, ptr);
+        return new_ptr;
+    }
+
     old = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->sizes, ptr));
     ws_assert(old != 0);
-
-    want = (size_t)wmem_backing_round_up(size, backing->pagesize);
 
     if (want == old) {
         return ptr;
@@ -290,7 +354,7 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
         return ptr;
     }
 
-    new_ptr = wmem_backing_alloc(backing, want);
+    new_ptr = wmem_backing_alloc_mapped(backing, want);
     memcpy(new_ptr, ptr, old);
     wmem_backing_free(backing, ptr);
 
@@ -313,6 +377,18 @@ uint64_t
 wmem_backing_bytes_reserved(const wmem_backing_t *backing)
 {
     return backing->reserve;
+}
+
+uint64_t
+wmem_backing_bytes_in_ram(const wmem_backing_t *backing)
+{
+    return backing->heap_high_water;
+}
+
+uint64_t
+wmem_backing_threshold(const wmem_backing_t *backing)
+{
+    return backing->threshold;
 }
 
 const char *
