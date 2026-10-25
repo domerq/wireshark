@@ -2454,6 +2454,33 @@ Should we document it? Deprecate it in favor of also using compress?
 ////
 --
 
+--spill-dir <directory>::
++
+--
+Keep the dissection state that has to live as long as the capture file is open
+-- conversations, reassembly state, per-packet protocol data, name resolution
+caches, and the per-frame index that two-pass analysis builds -- in a temporary
+file in __directory__ instead of in RAM.
+
+The file is unlinked as soon as it is created, so it never appears in the
+directory listing and is reclaimed even if *TShark* is killed. Pages are only
+resident while they are being used; under memory pressure the operating system
+writes them to the file rather than failing the allocation, so a capture whose
+state does not fit in RAM is analyzed slowly instead of not at all.
+
+Unlike *-M*, no state is discarded, so results are identical to a run that
+keeps everything in memory, and two-pass analysis (*-2*) is supported.
+--
+
+--spill-reserve <size>::
++
+--
+Address space, in MB, to reserve for *--spill-dir* (default 65536). This is an
+upper bound on how much dissection state a run can hold; it is not an amount
+of memory or of disk space that is consumed up front, since both the mapping
+and the file are sparse.
+--
+
 // Add a "capture-options" group for the common capture options?
 // Note a few options have different behavior in tshark, like -w,
 // because they operate on both live capture and when reading from file.

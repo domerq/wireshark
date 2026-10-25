@@ -125,7 +125,8 @@ wmem_destroy_allocator(wmem_allocator_t *allocator)
 }
 
 wmem_allocator_t *
-wmem_allocator_new(const wmem_allocator_type_t type)
+wmem_allocator_new_backed(const wmem_allocator_type_t type,
+        wmem_backing_t *backing)
 {
     wmem_allocator_t      *allocator;
     wmem_allocator_type_t  real_type;
@@ -147,7 +148,7 @@ wmem_allocator_new(const wmem_allocator_type_t type)
             wmem_simple_allocator_init(allocator);
             break;
         case WMEM_ALLOCATOR_BLOCK:
-            wmem_block_allocator_init(allocator);
+            wmem_block_allocator_init_backed(allocator, backing);
             break;
         case WMEM_ALLOCATOR_BLOCK_FAST:
             wmem_block_fast_allocator_init(allocator);
@@ -161,6 +162,12 @@ wmem_allocator_new(const wmem_allocator_type_t type)
     };
 
     return allocator;
+}
+
+wmem_allocator_t *
+wmem_allocator_new(const wmem_allocator_type_t type)
+{
+    return wmem_allocator_new_backed(type, NULL);
 }
 
 void

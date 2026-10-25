@@ -31,6 +31,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 set(WMEM_PUBLIC_HEADERS
 	wmem/wmem.h
+	wmem/wmem_backing.h
 	wmem/wmem_array.h
 	wmem/wmem_core.h
 	wmem/wmem_list.h
@@ -61,6 +62,7 @@ set(WMEM_HEADER_FILES
 
 set(WMEM_FILES
 	wmem/wmem_array.c
+	wmem/wmem_backing.c
 	wmem/wmem_core.c
 	wmem/wmem_allocator_block.c
 	wmem/wmem_allocator_block_fast.c

@@ -199,7 +199,45 @@ typedef struct _wmem_block_allocator_t {
     wmem_block_hdr_t   *block_list;
     wmem_block_chunk_t *master_head;
     wmem_block_chunk_t *recycler_head;
+
+    /* Where the OS-level blocks come from; NULL means the system heap. */
+    wmem_backing_t     *backing;
 } wmem_block_allocator_t;
+
+/* OS-LEVEL MEMORY
+ *
+ * Every block this allocator hands chunks out of comes from one of these
+ * three functions, so pointing them at a backing store is all it takes to
+ * move an entire allocator's memory off the heap. */
+
+static void *
+wmem_block_os_alloc(wmem_block_allocator_t *allocator, const size_t size)
+{
+    if (allocator->backing != NULL) {
+        return wmem_backing_alloc(allocator->backing, size);
+    }
+    return wmem_alloc(NULL, size);
+}
+
+static void *
+wmem_block_os_realloc(wmem_block_allocator_t *allocator, void *ptr,
+                      const size_t size)
+{
+    if (allocator->backing != NULL) {
+        return wmem_backing_realloc(allocator->backing, ptr, size);
+    }
+    return wmem_realloc(NULL, ptr, size);
+}
+
+static void
+wmem_block_os_free(wmem_block_allocator_t *allocator, void *ptr)
+{
+    if (allocator->backing != NULL) {
+        wmem_backing_free(allocator->backing, ptr);
+        return;
+    }
+    wmem_free(NULL, ptr);
+}
 
 /* DEBUG AND TEST */
 static int
@@ -762,7 +800,7 @@ wmem_block_new_block(wmem_block_allocator_t *allocator)
     wmem_block_hdr_t *block;
 
     /* allocate the new block and add it to the block list */
-    block = (wmem_block_hdr_t *)wmem_alloc(NULL, WMEM_BLOCK_SIZE);
+    block = (wmem_block_hdr_t *)wmem_block_os_alloc(allocator, WMEM_BLOCK_SIZE);
     wmem_block_add_to_block_list(allocator, block);
 
     /* initialize it */
@@ -779,7 +817,7 @@ wmem_block_alloc_jumbo(wmem_block_allocator_t *allocator, const size_t size)
     wmem_block_chunk_t *chunk;
 
     /* allocate a new block of exactly the right size */
-    block = (wmem_block_hdr_t *) wmem_alloc(NULL, size
+    block = (wmem_block_hdr_t *) wmem_block_os_alloc(allocator, size
             + WMEM_BLOCK_HEADER_SIZE
             + WMEM_CHUNK_HEADER_SIZE);
 
@@ -809,7 +847,7 @@ wmem_block_free_jumbo(wmem_block_allocator_t *allocator,
 
     wmem_block_remove_from_block_list(allocator, block);
 
-    wmem_free(NULL, block);
+    wmem_block_os_free(allocator, block);
 }
 
 /* Reallocs special 'jumbo' blocks of sizes that won't fit normally. */
@@ -822,7 +860,7 @@ wmem_block_realloc_jumbo(wmem_block_allocator_t *allocator,
 
     block = WMEM_CHUNK_TO_BLOCK(chunk);
 
-    block = (wmem_block_hdr_t *) wmem_realloc(NULL, block, size
+    block = (wmem_block_hdr_t *) wmem_block_os_realloc(allocator, block, size
             + WMEM_BLOCK_HEADER_SIZE
             + WMEM_CHUNK_HEADER_SIZE);
 
@@ -1019,7 +1057,7 @@ wmem_block_free_all(void *private_data)
         if (chunk->jumbo) {
             wmem_block_remove_from_block_list(allocator, cur);
             cur = cur->next;
-            wmem_free(NULL, WMEM_CHUNK_TO_BLOCK(chunk));
+            wmem_block_os_free(allocator, WMEM_CHUNK_TO_BLOCK(chunk));
         }
         else {
             wmem_block_init_block(allocator, cur);
@@ -1067,7 +1105,7 @@ wmem_block_gc(void *private_data)
             else if (allocator->master_head == chunk) {
                 allocator->master_head = free_chunk->next;
             }
-            wmem_free(NULL, cur);
+            wmem_block_os_free(allocator, cur);
         }
         else {
             /* part of this block is used, so add it to the new block list */
@@ -1090,7 +1128,8 @@ wmem_block_allocator_cleanup(void *private_data)
 }
 
 void
-wmem_block_allocator_init(wmem_allocator_t *allocator)
+wmem_block_allocator_init_backed(wmem_allocator_t *allocator,
+                                 wmem_backing_t *backing)
 {
     wmem_block_allocator_t *block_allocator;
 
@@ -1109,6 +1148,13 @@ wmem_block_allocator_init(wmem_allocator_t *allocator)
     block_allocator->block_list    = NULL;
     block_allocator->master_head   = NULL;
     block_allocator->recycler_head = NULL;
+    block_allocator->backing       = backing;
+}
+
+void
+wmem_block_allocator_init(wmem_allocator_t *allocator)
+{
+    wmem_block_allocator_init_backed(allocator, NULL);
 }
 
 /*

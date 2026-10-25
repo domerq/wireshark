@@ -1,0 +1,335 @@
+/* wmem_backing.c
+ * Wireshark Memory Manager disk backing store
+ *
+ * Wireshark - Network traffic analyzer
+ * By Gerald Combs <gerald@wireshark.org>
+ * Copyright 1998 Gerald Combs
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifdef __linux__
+/* for fallocate(), used to punch holes in the backing file */
+#define _GNU_SOURCE
+#endif
+
+#include "config.h"
+
+#include <string.h>
+
+#include <glib.h>
+#include <glib/gstdio.h>
+
+#include "wmem_backing.h"
+#include <wsutil/file_util.h>
+#include <wsutil/ws_assert.h>
+
+#ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#ifdef __linux__
+/* FALLOC_FL_PUNCH_HOLE lives here, not in <fcntl.h>. */
+#include <linux/falloc.h>
+#endif
+#endif
+
+struct _wmem_backing_t {
+    int         fd;
+    char       *path;
+    uint8_t    *base;      /* start of the mapped range */
+    uint64_t    reserve;   /* size of the mapped range */
+    uint64_t    bump;      /* offset of the first never-used byte */
+    uint64_t    live;      /* bytes currently handed out */
+    uint64_t    high_water;
+    size_t      pagesize;
+
+    /* region pointer -> region size. Frees come in without a size, and we
+     * want regions to stay page-aligned, so the sizes live beside the data
+     * rather than in a header. One entry per multi-megabyte region makes
+     * this metadata negligible. */
+    GHashTable *sizes;
+
+    /* region size -> GPtrArray of free regions of exactly that size. The
+     * block allocator asks for the same size nearly every time, so exact-fit
+     * reuse is enough and never fragments the range. */
+    GHashTable *free_lists;
+};
+
+static inline uint64_t
+wmem_backing_round_up(uint64_t value, uint64_t multiple)
+{
+    return ((value + multiple - 1) / multiple) * multiple;
+}
+
+/* Hand the pages of a region back to the OS, and the disk blocks back to the
+ * filesystem where we can. The region stays mapped and stays ours; it just
+ * stops costing anything until it is handed out again. */
+static void
+wmem_backing_release(wmem_backing_t *backing, void *ptr, size_t size)
+{
+#ifndef _WIN32
+    off_t offset = (off_t)((uint8_t *)ptr - backing->base);
+
+#if defined(__APPLE__) && defined(F_PUNCHHOLE)
+    {
+        fpunchhole_t args;
+
+        memset(&args, 0, sizeof(args));
+        args.fp_offset = offset;
+        args.fp_length = (off_t)size;
+        /* Best effort; a filesystem that cannot punch holes just keeps the
+         * blocks allocated. */
+        fcntl(backing->fd, F_PUNCHHOLE, &args);
+    }
+#elif defined(FALLOC_FL_PUNCH_HOLE)
+    fallocate(backing->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+            offset, (off_t)size);
+#else
+    (void)offset;
+#endif
+
+    /* Discard the pages without writing them back; the contents of a freed
+     * region are not ours to preserve. */
+#ifdef MADV_DONTNEED
+    madvise(ptr, size, MADV_DONTNEED);
+#elif defined(MADV_FREE)
+    madvise(ptr, size, MADV_FREE);
+#endif
+#else /* _WIN32 */
+    (void)backing; (void)ptr; (void)size;
+#endif
+}
+
+wmem_backing_t *
+wmem_backing_file_new(const char *dir, uint64_t reserve, char **err)
+{
+#ifdef _WIN32
+    (void)dir; (void)reserve;
+    *err = g_strdup("disk-backed memory is not supported on this platform");
+    return NULL;
+#else
+    wmem_backing_t *backing;
+    char           *path;
+    int             fd;
+    void           *base;
+    size_t          pagesize;
+
+    pagesize = (size_t)getpagesize();
+    reserve  = wmem_backing_round_up(reserve, pagesize);
+
+    path = g_build_filename(dir != NULL ? dir : g_get_tmp_dir(),
+            "wireshark_wmem_XXXXXX", NULL);
+
+    fd = g_mkstemp(path);
+    if (fd < 0) {
+        *err = g_strdup_printf("can't create %s: %s", path, g_strerror(errno));
+        g_free(path);
+        return NULL;
+    }
+
+    /* Sparse: this sets the size of the file, it does not allocate any disk
+     * blocks. Blocks are allocated as pages are written back. */
+    if (ftruncate(fd, (off_t)reserve) != 0) {
+        *err = g_strdup_printf("can't size %s to %" PRIu64 " bytes: %s",
+                path, reserve, g_strerror(errno));
+        ws_close(fd);
+        g_unlink(path);
+        g_free(path);
+        return NULL;
+    }
+
+    /* Map the whole range once. Addresses handed out of it are stable for
+     * the lifetime of the store, so nothing above us has to care that the
+     * memory is file-backed. */
+    base = mmap(NULL, (size_t)reserve, PROT_READ | PROT_WRITE, MAP_SHARED,
+            fd, 0);
+    if (base == MAP_FAILED) {
+        *err = g_strdup_printf("can't map %" PRIu64 " bytes of %s: %s",
+                reserve, path, g_strerror(errno));
+        ws_close(fd);
+        g_unlink(path);
+        g_free(path);
+        return NULL;
+    }
+
+#ifdef MADV_RANDOM
+    /* Dissection state is reached through hash tables and trees, so a fault
+     * says nothing about which page is wanted next. Reading ahead around it
+     * would just multiply the I/O. */
+    madvise(base, (size_t)reserve, MADV_RANDOM);
+#endif
+
+    /* The mapping keeps the file alive; unlinking now means no leftovers if
+     * we die, and no way for anything else to read the capture state. */
+    g_unlink(path);
+
+    backing             = g_new0(wmem_backing_t, 1);
+    backing->fd         = fd;
+    backing->path       = path;
+    backing->base       = (uint8_t *)base;
+    backing->reserve    = reserve;
+    backing->pagesize   = pagesize;
+    backing->sizes      = g_hash_table_new(g_direct_hash, g_direct_equal);
+    backing->free_lists = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+            NULL, (GDestroyNotify)g_ptr_array_unref);
+
+    return backing;
+#endif /* _WIN32 */
+}
+
+void
+wmem_backing_destroy(wmem_backing_t *backing)
+{
+    if (backing == NULL) {
+        return;
+    }
+
+#ifndef _WIN32
+    munmap(backing->base, (size_t)backing->reserve);
+    ws_close(backing->fd);
+#endif
+
+    g_hash_table_destroy(backing->sizes);
+    g_hash_table_destroy(backing->free_lists);
+    g_free(backing->path);
+    g_free(backing);
+}
+
+void *
+wmem_backing_alloc(wmem_backing_t *backing, size_t size)
+{
+    GPtrArray *bucket;
+    void      *ptr = NULL;
+    size_t     want;
+
+    want = (size_t)wmem_backing_round_up(size, backing->pagesize);
+
+    bucket = (GPtrArray *)g_hash_table_lookup(backing->free_lists,
+            GSIZE_TO_POINTER(want));
+    if (bucket != NULL && bucket->len > 0) {
+        ptr = g_ptr_array_remove_index_fast(bucket, bucket->len - 1);
+    }
+    else {
+        if (backing->bump + want > backing->reserve) {
+            ws_error("wmem: disk-backed memory exhausted after %" PRIu64
+                    " MB; raise the reserved size to analyze this capture",
+                    backing->reserve / (1024 * 1024));
+        }
+        ptr = backing->base + backing->bump;
+        backing->bump += want;
+    }
+
+    g_hash_table_insert(backing->sizes, ptr, GSIZE_TO_POINTER(want));
+
+    backing->live += want;
+    if (backing->live > backing->high_water) {
+        backing->high_water = backing->live;
+    }
+
+    return ptr;
+}
+
+void
+wmem_backing_free(wmem_backing_t *backing, void *ptr)
+{
+    GPtrArray *bucket;
+    size_t     size;
+
+    if (ptr == NULL) {
+        return;
+    }
+
+    size = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->sizes, ptr));
+    ws_assert(size != 0);
+    g_hash_table_remove(backing->sizes, ptr);
+
+    backing->live -= size;
+
+    wmem_backing_release(backing, ptr, size);
+
+    bucket = (GPtrArray *)g_hash_table_lookup(backing->free_lists,
+            GSIZE_TO_POINTER(size));
+    if (bucket == NULL) {
+        bucket = g_ptr_array_new();
+        g_hash_table_insert(backing->free_lists, GSIZE_TO_POINTER(size),
+                bucket);
+    }
+    g_ptr_array_add(bucket, ptr);
+}
+
+void *
+wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
+{
+    size_t old, want;
+    void  *new_ptr;
+
+    if (ptr == NULL) {
+        return wmem_backing_alloc(backing, size);
+    }
+
+    old = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->sizes, ptr));
+    ws_assert(old != 0);
+
+    want = (size_t)wmem_backing_round_up(size, backing->pagesize);
+
+    if (want == old) {
+        return ptr;
+    }
+
+    if (want < old) {
+        /* Shrinking: keep the head where it is and return the tail, which is
+         * page-aligned and therefore a valid region in its own right. */
+        void *tail = (uint8_t *)ptr + want;
+
+        g_hash_table_insert(backing->sizes, ptr, GSIZE_TO_POINTER(want));
+        g_hash_table_insert(backing->sizes, tail, GSIZE_TO_POINTER(old - want));
+        wmem_backing_free(backing, tail);
+        return ptr;
+    }
+
+    new_ptr = wmem_backing_alloc(backing, want);
+    memcpy(new_ptr, ptr, old);
+    wmem_backing_free(backing, ptr);
+
+    return new_ptr;
+}
+
+uint64_t
+wmem_backing_bytes_live(const wmem_backing_t *backing)
+{
+    return backing->live;
+}
+
+uint64_t
+wmem_backing_bytes_high_water(const wmem_backing_t *backing)
+{
+    return backing->high_water;
+}
+
+uint64_t
+wmem_backing_bytes_reserved(const wmem_backing_t *backing)
+{
+    return backing->reserve;
+}
+
+const char *
+wmem_backing_path(const wmem_backing_t *backing)
+{
+    return backing->path;
+}
+
+/*
+ * Editor modelines  -  https://www.wireshark.org/tools/modelines.html
+ *
+ * Local variables:
+ * c-basic-offset: 4
+ * tab-width: 8
+ * indent-tabs-mode: nil
+ * End:
+ *
+ * vi: set shiftwidth=4 tabstop=8 expandtab:
+ * :indentSize=4:tabSize=8:noTabs=true:
+ */

@@ -39,6 +39,9 @@
 static wmem_allocator_t *file_scope;
 static wmem_allocator_t *epan_scope;
 
+/* Where capture-lifetime memory comes from; NULL means the system heap. */
+static wmem_backing_t *capture_backing;
+
 /* File Scope */
 
 wmem_allocator_t *
@@ -70,6 +73,22 @@ wmem_leave_file_scope(void)
     wmem_gc(file_scope);
 }
 
+/* Capture-state backing store */
+
+void
+wmem_set_capture_backing(wmem_backing_t *backing)
+{
+    ws_assert(file_scope == NULL);
+
+    capture_backing = backing;
+}
+
+wmem_backing_t *
+wmem_capture_backing(void)
+{
+    return capture_backing;
+}
+
 /* Epan Scope */
 
 wmem_allocator_t *
@@ -90,7 +109,10 @@ wmem_init_scopes(void)
 
     wmem_init();
 
-    file_scope   = wmem_allocator_new(WMEM_ALLOCATOR_BLOCK);
+    /* Capture-lifetime state can be spilled to disk; epan scope holds the
+     * dissector registration tables, which are always hot and must not be. */
+    file_scope   = wmem_allocator_new_backed(WMEM_ALLOCATOR_BLOCK,
+            capture_backing);
     epan_scope   = wmem_allocator_new(WMEM_ALLOCATOR_BLOCK);
 
     /* Scopes are initialized to true by default on creation */

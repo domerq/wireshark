@@ -4641,7 +4641,10 @@ void
 addr_resolv_init(const char* app_env_var_prefix)
 {
     ws_assert(addr_resolv_scope == NULL);
-    addr_resolv_scope = wmem_allocator_new(WMEM_ALLOCATOR_BLOCK);
+    /* Name caches grow with the number of distinct addresses in the capture
+     * and live as long as it does, so they spill with the rest of it. */
+    addr_resolv_scope = wmem_allocator_new_backed(WMEM_ALLOCATOR_BLOCK,
+            wmem_capture_backing());
     initialize_services(app_env_var_prefix);
     initialize_ethers(app_env_var_prefix);
     initialize_ipxnets(app_env_var_prefix);

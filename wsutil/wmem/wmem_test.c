@@ -31,6 +31,11 @@
 
 typedef void (*wmem_verify_func)(wmem_allocator_t *allocator);
 
+/* When set, block allocators created by the test helpers below take their
+ * memory from this store instead of the heap, so that the same torture tests
+ * cover both sources. */
+static wmem_backing_t *test_backing;
+
 /* A local copy of wmem_allocator_new that ignores the
  * WIRESHARK_DEBUG_WMEM_OVERRIDE variable so that test functions are
  * guaranteed to actually get the allocator type they asked for */
@@ -49,7 +54,7 @@ wmem_allocator_force_new(const wmem_allocator_type_t type)
             wmem_simple_allocator_init(allocator);
             break;
         case WMEM_ALLOCATOR_BLOCK:
-            wmem_block_allocator_init(allocator);
+            wmem_block_allocator_init_backed(allocator, test_backing);
             break;
         case WMEM_ALLOCATOR_BLOCK_FAST:
             wmem_block_fast_allocator_init(allocator);
@@ -343,6 +348,32 @@ wmem_test_allocator_block(void)
     wmem_test_allocator(WMEM_ALLOCATOR_BLOCK, &wmem_block_verify,
             MAX_SIMULTANEOUS_ALLOCS*64);
     wmem_test_allocator_jumbo(WMEM_ALLOCATOR_BLOCK, &wmem_block_verify);
+}
+
+static void
+wmem_test_allocator_block_backed(void)
+{
+    char *err = NULL;
+
+    test_backing = wmem_backing_file_new(NULL,
+            UINT64_C(1) * 1024 * 1024 * 1024, &err);
+    if (test_backing == NULL) {
+        g_test_skip(err);
+        g_free(err);
+        return;
+    }
+
+    wmem_test_allocator(WMEM_ALLOCATOR_BLOCK, &wmem_block_verify,
+            MAX_SIMULTANEOUS_ALLOCS*64);
+    wmem_test_allocator_jumbo(WMEM_ALLOCATOR_BLOCK, &wmem_block_verify);
+
+    /* The allocators are destroyed by the tests above, so every region the
+     * store handed out must have been returned to it. */
+    g_assert_cmpuint(wmem_backing_bytes_high_water(test_backing), >, 0);
+    g_assert_cmpuint(wmem_backing_bytes_live(test_backing), ==, 0);
+
+    wmem_backing_destroy(test_backing);
+    test_backing = NULL;
 }
 
 static void
@@ -1466,6 +1497,7 @@ main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     g_test_add_func("/wmem/allocator/block",     wmem_test_allocator_block);
+    g_test_add_func("/wmem/allocator/blk_backed", wmem_test_allocator_block_backed);
     g_test_add_func("/wmem/allocator/blk_fast",  wmem_test_allocator_block_fast);
     g_test_add_func("/wmem/allocator/simple",    wmem_test_allocator_simple);
     g_test_add_func("/wmem/allocator/strict",    wmem_test_allocator_strict);
