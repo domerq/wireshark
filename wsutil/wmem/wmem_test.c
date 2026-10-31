@@ -378,6 +378,51 @@ wmem_test_allocator_block_backed(void)
     test_backing = NULL;
 }
 
+/* The block allocator recycles its 8 MB blocks, but jumbo allocations are
+ * arbitrary sizes, and a process that outlives one capture file asks for
+ * sizes that never recur. The store must put the space back whatever size
+ * is asked for next, or the range runs out with nothing outstanding. */
+static void
+wmem_test_backing_reuse(void)
+{
+    const uint64_t  reserve = UINT64_C(64) * 1024 * 1024;
+    wmem_backing_t *backing;
+    char           *err = NULL;
+    uint8_t        *ptr;
+    unsigned        i;
+
+    backing = wmem_backing_file_new(NULL, reserve, 0, &err);
+    if (backing == NULL) {
+        g_test_skip(err);
+        g_free(err);
+        return;
+    }
+
+    /* Every cycle asks for a size the store has never seen, and the sizes
+     * add up to many times the reserve. */
+    for (i = 0; i < 500; i++) {
+        size_t size = (1024 * 1024) + (i * 64 * 1024);
+
+        ptr = (uint8_t *)wmem_backing_alloc(backing, size);
+        ptr[0] = 0x42;
+        ptr[size - 1] = 0x42;
+        wmem_backing_free(backing, ptr);
+    }
+    g_assert_cmpuint(wmem_backing_bytes_live(backing), ==, 0);
+
+    /* Neighbouring free regions merge, so the whole range must be usable
+     * as a single allocation again. */
+    ptr = (uint8_t *)wmem_backing_alloc(backing, (size_t)reserve);
+    ptr[0] = 0x42;
+    ptr[reserve - 1] = 0x42;
+    g_assert_cmpuint(wmem_backing_bytes_live(backing), ==, reserve);
+    wmem_backing_free(backing, ptr);
+
+    g_assert_cmpuint(wmem_backing_bytes_live(backing), ==, 0);
+
+    wmem_backing_destroy(backing);
+}
+
 static void
 wmem_test_allocator_block_fast(void)
 {
@@ -1500,6 +1545,7 @@ main(int argc, char **argv)
 
     g_test_add_func("/wmem/allocator/block",     wmem_test_allocator_block);
     g_test_add_func("/wmem/allocator/blk_backed", wmem_test_allocator_block_backed);
+    g_test_add_func("/wmem/backing/reuse",      wmem_test_backing_reuse);
     g_test_add_func("/wmem/allocator/blk_fast",  wmem_test_allocator_block_fast);
     g_test_add_func("/wmem/allocator/simple",    wmem_test_allocator_simple);
     g_test_add_func("/wmem/allocator/strict",    wmem_test_allocator_strict);

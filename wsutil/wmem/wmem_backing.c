@@ -41,7 +41,6 @@ struct _wmem_backing_t {
     char       *path;
     uint8_t    *base;      /* start of the mapped range */
     uint64_t    reserve;   /* size of the mapped range */
-    uint64_t    bump;      /* offset of the first never-used byte */
     uint64_t    live;      /* bytes currently handed out from the file */
     uint64_t    high_water;
     size_t      pagesize;
@@ -61,16 +60,36 @@ struct _wmem_backing_t {
     GHashTable *sizes;
     GHashTable *heap_sizes;
 
-    /* region size -> GPtrArray of free regions of exactly that size. The
-     * block allocator asks for the same size nearly every time, so exact-fit
-     * reuse is enough and never fragments the range. */
-    GHashTable *free_lists;
+    /* Free regions: start -> size, and end -> start. A region being freed
+     * is merged with the free regions on either side of it, and an
+     * allocation is served from the smallest free region that holds it,
+     * splitting off the remainder. Without merging and splitting, a size
+     * that never recurs - every jumbo allocation is its own size - would
+     * pin the space it was carved from for the life of the store, and a
+     * long-lived process would exhaust the range with most of it free. */
+    GHashTable *free_starts;
+    GHashTable *free_ends;
 };
 
 static inline uint64_t
 wmem_backing_round_up(uint64_t value, uint64_t multiple)
 {
     return ((value + multiple - 1) / multiple) * multiple;
+}
+
+/* Record a region as free, or stop recording it. */
+static void
+wmem_backing_free_add(wmem_backing_t *backing, uint8_t *ptr, size_t size)
+{
+    g_hash_table_insert(backing->free_starts, ptr, GSIZE_TO_POINTER(size));
+    g_hash_table_insert(backing->free_ends, ptr + size, ptr);
+}
+
+static void
+wmem_backing_free_take(wmem_backing_t *backing, uint8_t *ptr, size_t size)
+{
+    g_hash_table_remove(backing->free_starts, ptr);
+    g_hash_table_remove(backing->free_ends, ptr + size);
 }
 
 /* Hand the pages of a region back to the OS, and the disk blocks back to the
@@ -185,8 +204,11 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
     backing->pagesize   = pagesize;
     backing->sizes      = g_hash_table_new(g_direct_hash, g_direct_equal);
     backing->heap_sizes = g_hash_table_new(g_direct_hash, g_direct_equal);
-    backing->free_lists = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-            NULL, (GDestroyNotify)g_ptr_array_unref);
+    backing->free_starts = g_hash_table_new(g_direct_hash, g_direct_equal);
+    backing->free_ends  = g_hash_table_new(g_direct_hash, g_direct_equal);
+
+    /* The whole range starts out free; allocation is carving it up. */
+    wmem_backing_free_add(backing, backing->base, (size_t)reserve);
 
     return backing;
 #endif /* _WIN32 */
@@ -206,7 +228,8 @@ wmem_backing_destroy(wmem_backing_t *backing)
 
     g_hash_table_destroy(backing->sizes);
     g_hash_table_destroy(backing->heap_sizes);
-    g_hash_table_destroy(backing->free_lists);
+    g_hash_table_destroy(backing->free_starts);
+    g_hash_table_destroy(backing->free_ends);
     g_free(backing->path);
     g_free(backing);
 }
@@ -215,23 +238,43 @@ wmem_backing_destroy(wmem_backing_t *backing)
 static void *
 wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
 {
-    GPtrArray *bucket;
-    void      *ptr = NULL;
+    GHashTableIter iter;
+    void          *key, *value;
+    uint8_t       *best = NULL;
+    size_t         best_size = 0;
+    uint8_t       *ptr;
 
-    bucket = (GPtrArray *)g_hash_table_lookup(backing->free_lists,
-            GSIZE_TO_POINTER(want));
-    if (bucket != NULL && bucket->len > 0) {
-        ptr = g_ptr_array_remove_index_fast(bucket, bucket->len - 1);
-    }
-    else {
-        if (backing->bump + want > backing->reserve) {
-            ws_error("wmem: disk-backed memory exhausted after %" PRIu64
-                    " MB; raise the reserved size to analyze this capture",
-                    backing->reserve / (1024 * 1024));
+    /* Best fit, so that a long run of free space is left for the request
+     * that needs all of it. The number of free regions stays small because
+     * neighbours are merged as they are freed. */
+    g_hash_table_iter_init(&iter, backing->free_starts);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        size_t size = GPOINTER_TO_SIZE(value);
+
+        if (size < want) {
+            continue;
         }
-        ptr = backing->base + backing->bump;
-        backing->bump += want;
+        if (best == NULL || size < best_size) {
+            best      = (uint8_t *)key;
+            best_size = size;
+        }
+        if (size == want) {
+            break;
+        }
     }
+
+    if (best == NULL) {
+        ws_error("wmem: disk-backed memory exhausted after %" PRIu64
+                " MB; raise the reserved size to analyze this capture",
+                backing->reserve / (1024 * 1024));
+    }
+
+    wmem_backing_free_take(backing, best, best_size);
+    if (best_size > want) {
+        /* The tail is page-aligned, so it is a region in its own right. */
+        wmem_backing_free_add(backing, best + want, best_size - want);
+    }
+    ptr = best;
 
     g_hash_table_insert(backing->sizes, ptr, GSIZE_TO_POINTER(want));
 
@@ -269,8 +312,9 @@ wmem_backing_alloc(wmem_backing_t *backing, size_t size)
 void
 wmem_backing_free(wmem_backing_t *backing, void *ptr)
 {
-    GPtrArray *bucket;
-    size_t     size;
+    uint8_t *start, *next, *prev;
+    size_t   size, neighbour;
+    void    *value;
 
     if (ptr == NULL) {
         return;
@@ -292,14 +336,29 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
 
     wmem_backing_release(backing, ptr, size);
 
-    bucket = (GPtrArray *)g_hash_table_lookup(backing->free_lists,
-            GSIZE_TO_POINTER(size));
-    if (bucket == NULL) {
-        bucket = g_ptr_array_new();
-        g_hash_table_insert(backing->free_lists, GSIZE_TO_POINTER(size),
-                bucket);
+    /* Merge with the free region that ends where this one starts, and with
+     * the one that starts where it ends, so that the space goes back as one
+     * extent rather than as a size that may never be asked for again. */
+    start = (uint8_t *)ptr;
+
+    prev = (uint8_t *)g_hash_table_lookup(backing->free_ends, start);
+    if (prev != NULL) {
+        neighbour = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->free_starts,
+                    prev));
+        wmem_backing_free_take(backing, prev, neighbour);
+        start = prev;
+        size += neighbour;
     }
-    g_ptr_array_add(bucket, ptr);
+
+    next = start + size;
+    if (g_hash_table_lookup_extended(backing->free_starts, next, NULL,
+                &value)) {
+        neighbour = GPOINTER_TO_SIZE(value);
+        wmem_backing_free_take(backing, next, neighbour);
+        size += neighbour;
+    }
+
+    wmem_backing_free_add(backing, start, size);
 }
 
 void *
