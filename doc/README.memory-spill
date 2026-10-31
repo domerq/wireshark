@@ -271,8 +271,10 @@ swap. On macOS use "peak memory footprint" or the malloc interposer in
 test/benchmark; on Linux use a cgroup limit, which is also the clearest
 demonstration - under "docker run --memory=1g" the unmodified run is
 OOM-killed (SIGKILL) after 3 s having produced nothing, while the same run
-with --spill-dir completes with identical output and a resident set bounded
-by the limit.
+with "--spill-dir /work --spill-after 0" completes with identical output
+and a resident set bounded by the limit. Any such demonstration has to set
+the watermark below the limit it is imposing, or the store spends its heap
+allowance first and dies exactly like the unmodified run.
 
 10. Reproducing the measurements
 --------------------------------
