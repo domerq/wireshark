@@ -45,9 +45,9 @@ run gets slower, and without changing any output. Specifically:
   - no state discarded, unlike -M;
   - no per-dissector changes, so the 3000+ dissectors are unaffected.
 
-Out of scope: live capture (state is bounded by the capture duration, not the
-file), the Qt GUI (random access needs more than this; see section 8), and
-parallel dissection (an orthogonal track).
+Out of scope: live capture (state is bounded by the capture duration, not
+the file) and parallel dissection (an orthogonal track). The Qt GUI takes
+the same options; what it still pays for separately is in section 8.
 
 3. Architecture
 ---------------
@@ -76,14 +76,16 @@ store down to wmem_block_allocator_init_backed(), and everything else about
 the allocator is unchanged. With a NULL store the behaviour is exactly as
 before.
 
-TShark creates one store from --spill-dir before epan_init() and attaches it
-to the allocators whose contents live as long as the capture file:
+TShark and Wireshark create one store from --spill-dir before epan_init()
+and attach it to the allocators whose contents live as long as the capture
+file:
 
     file scope            conversations, TCP analysis, per-packet proto data,
                           streaming reassembly, reassembly tables and keys,
                           reassembled buffers
     addr_resolv_scope     name resolution caches
-    frame_data_sequence   the per-frame index built by two-pass analysis
+    frame_data_sequence   the per-frame index (two-pass analysis, and every
+                          capture opened in the GUI)
     fragment_data_scope   copies of individual fragment payloads
 
 Epan scope is never backed: it holds the dissector registration tables, which
@@ -117,6 +119,7 @@ objects with one lifetime.
                                                       of conversations
     GHashTable internals of the reassembly tables     grows with fragments
     wiretap read buffers                              bounded per packet
+    Qt packet list records (GUI only)                 ~180 B per packet
 
 Measured residual on the 4.1 GB capture with -z conv,tcp: 141 MB, against
 8954 MB of state in the store.
@@ -132,9 +135,18 @@ verification is equality of output rather than a new set of expectations:
   - 9.53 M packet capture: -z conv,tcp output identical, 149018 rows;
   - -T fields, -T json, -2 -T json, -z endpoints,ip identical;
   - the project test suite (2089 tests) and reassemble_test unchanged;
+  - repeated session teardown and rebuild, which is what the GUI does on
+    every preference change: -M 10000 over a 300 k packet capture (30
+    resets) gives identical -z conv,tcp output with and without the store;
+  - Wireshark with the same capture, --spill-after 0: 197 MB of dissection
+    state moves out of the heap into the backing file (vmmap: 339 MB dirty
+    malloc without the option, 128 MB malloc plus 197 MB resident file
+    pages with it);
   - wmem_test runs its full allocator torture suite, including jumbo
     allocations and the invariant checker, against a file-backed allocator
-    (/wmem/allocator/blk_backed) and asserts the store is fully reclaimed.
+    (/wmem/allocator/blk_backed) and asserts the store is fully reclaimed;
+    /wmem/backing/reuse and /wmem/backing/grow cover reusing space at a
+    size it was not freed at, and outgrowing the mapped range.
 
 The one behavioural subtlety is teardown order: a tvb wrapping reassembly
 data can be freed after file scope is gone, so the free callback checks
@@ -208,10 +220,39 @@ sub-arena, so a cold flow's state is page-contiguous and faults back as one
 unit; that also makes explicit LRU eviction of idle flows possible, which
 would subsume -M without discarding anything that is still reachable.
 
-GUI. The Qt interface is unchanged: it never calls
-wmem_set_capture_backing(). Enabling it there is a few lines, but random
-access to an arbitrary packet needs dissection state as of that packet, which
-needs the per-flow arenas above plus periodic checkpoints.
+GUI. Wireshark takes the same three options and creates the store where
+TShark does, before epan_init() in ui/qt/main.cpp, and needs nothing else.
+Random access to an arbitrary packet does not need dissection state as of
+that packet: cf_select_packet() seeks to the record and calls
+epan_dissect_run() against the accumulated state with fd->visited already
+set (file.c), exactly as TShark's second pass does. What makes the result
+right for that packet is that the first pass memoized it - TCP analysis in
+tcpd->acked_table, reassembly in reassembled_table, dissector scratch in
+fd->pfd - all keyed by frame number, and that conversation lookup is
+scoped by frame number. Spilling discards nothing, so every one of those
+lookups still finds what it found before.
+
+Two things did have to change for a process that outlives one capture
+file, both in the store rather than in the GUI: free space is merged and
+split rather than reused only at the size it was freed at, because the GUI
+rebuilds file scope on every preference change and jumbo allocations are
+never the same size twice; and exhausting the mapped range maps more
+instead of calling ws_error(), because aborting a GUI with an open capture
+is not an option.
+
+What spilling does not fix there is the Qt side: one PacketListRecord per
+packet, about 180 bytes with the row vectors, which is the dominant term
+above roughly 10 M packets. Interactive latency is the other cost -
+scrolling past the column cache re-dissects a row, and changing the
+display filter re-dissects the whole file, so both can now fault pages
+back from disk.
+
+Two gaps remain on the GUI side. There is no equivalent of TShark's
+report of peak state at exit, so there is nothing to tune --spill-after
+against; the natural home for it is the capture file properties dialog.
+And the interactive paths above have not been measured, because driving
+the widgets needs a display: the figures here come from running the GUI
+with the offscreen platform plugin and reading vmmap.
 
 9. Platform notes
 -----------------
