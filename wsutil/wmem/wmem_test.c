@@ -423,6 +423,53 @@ wmem_test_backing_reuse(void)
     wmem_backing_destroy(backing);
 }
 
+/* The reserved size is where the store starts, not where it stops: state
+ * that outgrows it has to get more memory rather than kill the process. */
+static void
+wmem_test_backing_grow(void)
+{
+    const uint64_t  reserve = UINT64_C(8) * 1024 * 1024;
+    const size_t    chunk   = 1024 * 1024;
+    wmem_backing_t *backing;
+    char           *err = NULL;
+    uint8_t        *held[64];
+    uint8_t        *big;
+    unsigned        i;
+
+    backing = wmem_backing_file_new(NULL, reserve, 0, &err);
+    if (backing == NULL) {
+        g_test_skip(err);
+        g_free(err);
+        return;
+    }
+    g_assert_cmpuint(wmem_backing_bytes_reserved(backing), ==, reserve);
+
+    /* Hold eight times the reserve at once. */
+    for (i = 0; i < G_N_ELEMENTS(held); i++) {
+        held[i] = (uint8_t *)wmem_backing_alloc(backing, chunk);
+        held[i][0] = 0x42;
+        held[i][chunk - 1] = 0x42;
+    }
+    g_assert_cmpuint(wmem_backing_bytes_live(backing), ==,
+            G_N_ELEMENTS(held) * chunk);
+    g_assert_cmpuint(wmem_backing_bytes_reserved(backing), >=,
+            G_N_ELEMENTS(held) * chunk);
+
+    /* A single region larger than the growth step gets a mapping of its
+     * own. */
+    big = (uint8_t *)wmem_backing_alloc(backing, (size_t)reserve * 3);
+    big[0] = 0x42;
+    big[reserve * 3 - 1] = 0x42;
+    wmem_backing_free(backing, big);
+
+    for (i = 0; i < G_N_ELEMENTS(held); i++) {
+        wmem_backing_free(backing, held[i]);
+    }
+    g_assert_cmpuint(wmem_backing_bytes_live(backing), ==, 0);
+
+    wmem_backing_destroy(backing);
+}
+
 static void
 wmem_test_allocator_block_fast(void)
 {
@@ -1546,6 +1593,7 @@ main(int argc, char **argv)
     g_test_add_func("/wmem/allocator/block",     wmem_test_allocator_block);
     g_test_add_func("/wmem/allocator/blk_backed", wmem_test_allocator_block_backed);
     g_test_add_func("/wmem/backing/reuse",      wmem_test_backing_reuse);
+    g_test_add_func("/wmem/backing/grow",       wmem_test_backing_grow);
     g_test_add_func("/wmem/allocator/blk_fast",  wmem_test_allocator_block_fast);
     g_test_add_func("/wmem/allocator/simple",    wmem_test_allocator_simple);
     g_test_add_func("/wmem/allocator/strict",    wmem_test_allocator_strict);

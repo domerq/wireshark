@@ -52,14 +52,22 @@ parallel dissection (an orthogonal track).
 3. Architecture
 ---------------
 
-A backing store (wmem_backing_t) is a single large shared mapping of a sparse
-temporary file. Allocators hand out regions of it instead of regions of the
-heap. Because the whole range is reserved and mapped once, addresses are
-stable for the life of the store, so nothing above the allocator - not the
-dissectors, not the data structures, not even the allocator's own chunk
-logic - has to know where the memory lives. Pages are resident only while in
-use; under memory pressure the kernel writes them to the backing file rather
-than failing the allocation.
+A backing store (wmem_backing_t) is one or more large shared mappings of a
+sparse temporary file. Allocators hand out regions of them instead of
+regions of the heap. Because a mapping is made once and never moved,
+addresses are stable for the life of the store, so nothing above the
+allocator - not the dissectors, not the data structures, not even the
+allocator's own chunk logic - has to know where the memory lives. Pages are
+resident only while in use; under memory pressure the kernel writes them to
+the backing file rather than failing the allocation.
+
+Within a mapping the store keeps a free list of start and end addresses: a
+region being freed is merged with its neighbours, and a request is served
+from the smallest free region that holds it. That matters for processes
+that outlive one capture file, because jumbo allocations are page-rounded
+to sizes that need not ever recur. When nothing mapped can hold a request,
+the store maps another range rather than failing, so --spill-reserve is a
+starting size and not a ceiling.
 
 The block allocator took all of its OS memory from exactly three places
 (8 MB blocks, jumbo allocations, and their frees), so pointing it at a store
@@ -187,10 +195,12 @@ itself, is what differs between the two systems.
 8. Limits and next steps
 ------------------------
 
-Capacity. With the heap term now flat, the limits are disk, the address space
-reserved by --spill-reserve (64 GB by default, and currently fatal rather
-than extensible when exhausted), tap accumulators for runs that use -z on
-very large captures, and 32-bit frame numbers.
+Capacity. With the heap term now flat, the limits are disk, tap accumulators
+for runs that use -z on very large captures, and 32-bit frame numbers.
+--spill-reserve is not one of them: it is how much address space is mapped
+at a time (64 GB by default), and the store maps another range of that size
+when the mapped ones are full, so it only has to be raised to reduce the
+number of mappings.
 
 Speed. Page-granular eviction against flow-granular access is the remaining
 problem. The fix is to make file scope resolve to a per-conversation

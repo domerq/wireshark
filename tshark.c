@@ -618,7 +618,7 @@ print_usage(FILE *output)
     fprintf(output, "                           whose state exceeds memory can still be analyzed\n");
     fprintf(output, "  --spill-after <size>     dissection state to keep in RAM before spilling, in MB\n");
     fprintf(output, "                           (def: %" PRIu64 "MB; 0 spills everything)\n", spill_after / (1024 * 1024));
-    fprintf(output, "  --spill-reserve <size>   address space to reserve for --spill-dir, in MB\n");
+    fprintf(output, "  --spill-reserve <size>   address space to map for --spill-dir at a time, in MB\n");
     fprintf(output, "                           (def: %" PRIu64 "MB)\n", spill_reserve / (1024 * 1024));
     fprintf(output, "\n");
 

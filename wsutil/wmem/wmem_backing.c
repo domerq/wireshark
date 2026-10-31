@@ -36,11 +36,21 @@
 #endif
 #endif
 
+/* One mapped piece of the backing file. The store starts with a single
+ * piece and maps another when it runs out, so the reserved size is where
+ * the store starts rather than how far it can go. */
+typedef struct {
+    uint8_t    *base;      /* start of the mapping */
+    uint64_t    offset;    /* where it lives in the backing file */
+    uint64_t    size;
+} wmem_backing_segment_t;
+
 struct _wmem_backing_t {
     int         fd;
     char       *path;
-    uint8_t    *base;      /* start of the mapped range */
-    uint64_t    reserve;   /* size of the mapped range */
+    GArray     *segments;
+    uint64_t    reserve;   /* total size of the mappings */
+    uint64_t    grow;      /* size to map when the mappings are full */
     uint64_t    live;      /* bytes currently handed out from the file */
     uint64_t    high_water;
     size_t      pagesize;
@@ -92,6 +102,79 @@ wmem_backing_free_take(wmem_backing_t *backing, uint8_t *ptr, size_t size)
     g_hash_table_remove(backing->free_ends, ptr + size);
 }
 
+/* Which mapping a region came from. There is one segment per growth step,
+ * so this list is short and a scan is cheaper than an index. */
+static const wmem_backing_segment_t *
+wmem_backing_segment_of(wmem_backing_t *backing, const uint8_t *ptr)
+{
+    unsigned i;
+
+    for (i = 0; i < backing->segments->len; i++) {
+        const wmem_backing_segment_t *segment =
+            &g_array_index(backing->segments, wmem_backing_segment_t, i);
+
+        if (ptr >= segment->base && ptr < segment->base + segment->size) {
+            return segment;
+        }
+    }
+
+    ws_assert_not_reached();
+}
+
+/* Map another piece of the backing file and make it available. Returns
+ * false with *err set if the OS will not give us the space. */
+static bool
+wmem_backing_map_segment(wmem_backing_t *backing, uint64_t size, char **err)
+{
+#ifdef _WIN32
+    (void)backing; (void)size;
+    *err = g_strdup("disk-backed memory is not supported on this platform");
+    return false;
+#else
+    wmem_backing_segment_t segment;
+    void                  *base;
+    uint64_t               offset = backing->reserve;
+
+    /* Sparse: this sets the size of the file, it does not allocate any disk
+     * blocks. Blocks are allocated as pages are written back. */
+    if (ftruncate(backing->fd, (off_t)(offset + size)) != 0) {
+        *err = g_strdup_printf("can't size %s to %" PRIu64 " bytes: %s",
+                backing->path, offset + size, g_strerror(errno));
+        return false;
+    }
+
+    /* Map the whole piece at once. Addresses handed out of it are stable
+     * for the lifetime of the store, so nothing above us has to care that
+     * the memory is file-backed. */
+    base = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED,
+            backing->fd, (off_t)offset);
+    if (base == MAP_FAILED) {
+        *err = g_strdup_printf("can't map %" PRIu64 " bytes of %s: %s",
+                size, backing->path, g_strerror(errno));
+        return false;
+    }
+
+#ifdef MADV_RANDOM
+    /* Dissection state is reached through hash tables and trees, so a fault
+     * says nothing about which page is wanted next. Reading ahead around it
+     * would just multiply the I/O. */
+    madvise(base, (size_t)size, MADV_RANDOM);
+#endif
+
+    segment.base   = (uint8_t *)base;
+    segment.offset = offset;
+    segment.size   = size;
+    g_array_append_val(backing->segments, segment);
+
+    backing->reserve += size;
+
+    /* A new mapping is one free region. */
+    wmem_backing_free_add(backing, segment.base, (size_t)size);
+
+    return true;
+#endif /* _WIN32 */
+}
+
 /* Hand the pages of a region back to the OS, and the disk blocks back to the
  * filesystem where we can. The region stays mapped and stays ours; it just
  * stops costing anything until it is handed out again. */
@@ -99,7 +182,10 @@ static void
 wmem_backing_release(wmem_backing_t *backing, void *ptr, size_t size)
 {
 #ifndef _WIN32
-    off_t offset = (off_t)((uint8_t *)ptr - backing->base);
+    const wmem_backing_segment_t *segment = wmem_backing_segment_of(backing,
+            (uint8_t *)ptr);
+    off_t offset = (off_t)(segment->offset +
+            (uint64_t)((uint8_t *)ptr - segment->base));
 
 #if defined(__APPLE__) && defined(F_PUNCHHOLE)
     {
@@ -143,7 +229,6 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
     wmem_backing_t *backing;
     char           *path;
     int             fd;
-    void           *base;
     size_t          pagesize;
 
     pagesize = (size_t)getpagesize();
@@ -159,47 +244,12 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
         return NULL;
     }
 
-    /* Sparse: this sets the size of the file, it does not allocate any disk
-     * blocks. Blocks are allocated as pages are written back. */
-    if (ftruncate(fd, (off_t)reserve) != 0) {
-        *err = g_strdup_printf("can't size %s to %" PRIu64 " bytes: %s",
-                path, reserve, g_strerror(errno));
-        ws_close(fd);
-        g_unlink(path);
-        g_free(path);
-        return NULL;
-    }
-
-    /* Map the whole range once. Addresses handed out of it are stable for
-     * the lifetime of the store, so nothing above us has to care that the
-     * memory is file-backed. */
-    base = mmap(NULL, (size_t)reserve, PROT_READ | PROT_WRITE, MAP_SHARED,
-            fd, 0);
-    if (base == MAP_FAILED) {
-        *err = g_strdup_printf("can't map %" PRIu64 " bytes of %s: %s",
-                reserve, path, g_strerror(errno));
-        ws_close(fd);
-        g_unlink(path);
-        g_free(path);
-        return NULL;
-    }
-
-#ifdef MADV_RANDOM
-    /* Dissection state is reached through hash tables and trees, so a fault
-     * says nothing about which page is wanted next. Reading ahead around it
-     * would just multiply the I/O. */
-    madvise(base, (size_t)reserve, MADV_RANDOM);
-#endif
-
-    /* The mapping keeps the file alive; unlinking now means no leftovers if
-     * we die, and no way for anything else to read the capture state. */
-    g_unlink(path);
-
     backing             = g_new0(wmem_backing_t, 1);
     backing->fd         = fd;
     backing->path       = path;
-    backing->base       = (uint8_t *)base;
-    backing->reserve    = reserve;
+    backing->segments   = g_array_new(FALSE, FALSE,
+            sizeof(wmem_backing_segment_t));
+    backing->grow       = reserve;
     backing->threshold  = threshold;
     backing->pagesize   = pagesize;
     backing->sizes      = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -207,8 +257,15 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
     backing->free_starts = g_hash_table_new(g_direct_hash, g_direct_equal);
     backing->free_ends  = g_hash_table_new(g_direct_hash, g_direct_equal);
 
-    /* The whole range starts out free; allocation is carving it up. */
-    wmem_backing_free_add(backing, backing->base, (size_t)reserve);
+    if (!wmem_backing_map_segment(backing, reserve, err)) {
+        g_unlink(path);
+        wmem_backing_destroy(backing);
+        return NULL;
+    }
+
+    /* The mapping keeps the file alive; unlinking now means no leftovers if
+     * we die, and no way for anything else to read the capture state. */
+    g_unlink(path);
 
     return backing;
 #endif /* _WIN32 */
@@ -222,9 +279,20 @@ wmem_backing_destroy(wmem_backing_t *backing)
     }
 
 #ifndef _WIN32
-    munmap(backing->base, (size_t)backing->reserve);
+    {
+        unsigned i;
+
+        for (i = 0; i < backing->segments->len; i++) {
+            const wmem_backing_segment_t *segment =
+                &g_array_index(backing->segments, wmem_backing_segment_t, i);
+
+            munmap(segment->base, (size_t)segment->size);
+        }
+    }
     ws_close(backing->fd);
 #endif
+
+    g_array_free(backing->segments, TRUE);
 
     g_hash_table_destroy(backing->sizes);
     g_hash_table_destroy(backing->heap_sizes);
@@ -234,15 +302,14 @@ wmem_backing_destroy(wmem_backing_t *backing)
     g_free(backing);
 }
 
-/* Hand out a region from the file. */
-static void *
-wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
+/* The smallest free region that holds want bytes, or NULL. */
+static uint8_t *
+wmem_backing_best_fit(wmem_backing_t *backing, size_t want, size_t *found)
 {
     GHashTableIter iter;
     void          *key, *value;
     uint8_t       *best = NULL;
     size_t         best_size = 0;
-    uint8_t       *ptr;
 
     /* Best fit, so that a long run of free space is left for the request
      * that needs all of it. The number of free regions stays small because
@@ -263,10 +330,33 @@ wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
         }
     }
 
+    *found = best_size;
+    return best;
+}
+
+/* Hand out a region from the file. */
+static void *
+wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
+{
+    uint8_t *best;
+    size_t   best_size;
+    uint8_t *ptr;
+
+    best = wmem_backing_best_fit(backing, want, &best_size);
     if (best == NULL) {
-        ws_error("wmem: disk-backed memory exhausted after %" PRIu64
-                " MB; raise the reserved size to analyze this capture",
-                backing->reserve / (1024 * 1024));
+        /* Nothing mapped can hold it, so map more. The reserved size is
+         * the growth step as well as the starting size, and a request
+         * larger than that gets a mapping of its own. */
+        uint64_t size = backing->grow > want ? backing->grow : want;
+        char    *err  = NULL;
+
+        if (!wmem_backing_map_segment(backing, size, &err)) {
+            ws_error("wmem: can't grow disk-backed memory past %" PRIu64
+                    " MB: %s", backing->reserve / (1024 * 1024), err);
+        }
+
+        best = wmem_backing_best_fit(backing, want, &best_size);
+        ws_assert(best != NULL);
     }
 
     wmem_backing_free_take(backing, best, best_size);
@@ -312,6 +402,7 @@ wmem_backing_alloc(wmem_backing_t *backing, size_t size)
 void
 wmem_backing_free(wmem_backing_t *backing, void *ptr)
 {
+    const wmem_backing_segment_t *segment;
     uint8_t *start, *next, *prev;
     size_t   size, neighbour;
     void    *value;
@@ -338,11 +429,14 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
 
     /* Merge with the free region that ends where this one starts, and with
      * the one that starts where it ends, so that the space goes back as one
-     * extent rather than as a size that may never be asked for again. */
-    start = (uint8_t *)ptr;
+     * extent rather than as a size that may never be asked for again.
+     * Mappings are independent of each other, so a merge must stay inside
+     * the one this region came from even where two of them abut. */
+    start   = (uint8_t *)ptr;
+    segment = wmem_backing_segment_of(backing, start);
 
     prev = (uint8_t *)g_hash_table_lookup(backing->free_ends, start);
-    if (prev != NULL) {
+    if (prev != NULL && prev >= segment->base) {
         neighbour = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->free_starts,
                     prev));
         wmem_backing_free_take(backing, prev, neighbour);
@@ -351,7 +445,8 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
     }
 
     next = start + size;
-    if (g_hash_table_lookup_extended(backing->free_starts, next, NULL,
+    if (next < segment->base + segment->size &&
+            g_hash_table_lookup_extended(backing->free_starts, next, NULL,
                 &value)) {
         neighbour = GPOINTER_TO_SIZE(value);
         wmem_backing_free_take(backing, next, neighbour);
