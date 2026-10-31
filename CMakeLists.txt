@@ -3576,6 +3576,7 @@ if(BUILD_tshark)
 	)
 	set(tshark_FILES
 		$<TARGET_OBJECTS:extcap_support>
+		flow_shard.c
 		tshark-tap-register.c
 		tshark.c
 		app/wireshark_flavor.c

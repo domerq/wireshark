@@ -56,6 +56,7 @@
 #include <wiretap/wtap_opttypes.h>
 
 #include "globals.h"
+#include "flow_shard.h"
 #include <epan/timestamp.h>
 #include <epan/packet.h>
 #ifdef HAVE_LUA
@@ -147,6 +148,7 @@
 #define LONGOPT_SPILL_DIR               LONGOPT_BASE_APPLICATION+13
 #define LONGOPT_SPILL_RESERVE           LONGOPT_BASE_APPLICATION+14
 #define LONGOPT_SPILL_AFTER             LONGOPT_BASE_APPLICATION+15
+#define LONGOPT_SHARD_PLAN              LONGOPT_BASE_APPLICATION+16
 
 capture_file cfile;
 
@@ -163,6 +165,8 @@ static const char *spill_dir;
 static uint64_t spill_reserve = UINT64_C(64) * 1024 * 1024 * 1024;
 static uint64_t spill_after = UINT64_C(2) * 1024 * 1024 * 1024;
 static wmem_backing_t *capture_backing;
+
+static unsigned shard_plan_shards;
 
 static uint32_t selected_frame_number;
 
@@ -353,6 +357,43 @@ print_elapsed_json(const char *cf_name, const char *dfilter)
     json_dumper_end_array(&dumper);
     json_dumper_end_object(&dumper);
     json_dumper_finish(&dumper);
+}
+
+/* Report how a capture would divide between N workers: the index pass and
+ * the assignment that flow-sharded dissection runs before forking, without
+ * the dissection. Checking a capture and a worker count against each other
+ * is the one thing this is good for on its own. */
+static int
+print_shard_plan(const char *filename, unsigned shards)
+{
+    flow_shard_plan_t *plan;
+    int                err = 0;
+    char              *err_info = NULL;
+    double             ideal;
+    unsigned           i;
+
+    plan = flow_shard_plan_new(filename, shards, &err, &err_info);
+    if (plan == NULL) {
+        report_cfile_open_failure(filename, err, err_info);
+        return WS_EXIT_INVALID_FILE;
+    }
+
+    printf("%" PRIu64 " packets, %" PRIu64 " address pairs, "
+            "%" PRIu64 " with no IP pair\n",
+            flow_shard_plan_packets(plan), flow_shard_plan_pairs(plan),
+            flow_shard_plan_unkeyed(plan));
+
+    ideal = (double)flow_shard_plan_packets(plan) / shards;
+    for (i = 0; i < shards; i++) {
+        uint64_t packets = flow_shard_plan_shard_packets(plan, i);
+
+        printf("  shard %u: %9" PRIu64 " packets (%.2fx ideal)\n",
+                i, packets, ideal > 0.0 ? packets / ideal : 0.0);
+    }
+
+    flow_shard_plan_free(plan);
+
+    return EXIT_SUCCESS;
 }
 
 static void
@@ -620,6 +661,8 @@ print_usage(FILE *output)
     fprintf(output, "                           (def: %" PRIu64 "MB; 0 spills everything)\n", spill_after / (1024 * 1024));
     fprintf(output, "  --spill-reserve <size>   address space to map for --spill-dir at a time, in MB\n");
     fprintf(output, "                           (def: %" PRIu64 "MB)\n", spill_reserve / (1024 * 1024));
+    fprintf(output, "  --shard-plan <count>     print how this capture would divide between <count>\n");
+    fprintf(output, "                           workers that each dissect whole flows, and exit\n");
     fprintf(output, "\n");
 
     ws_log_print_usage(output);
@@ -1118,6 +1161,7 @@ main(int argc, char *argv[])
         {"spill-dir", ws_required_argument, NULL, LONGOPT_SPILL_DIR},
         {"spill-reserve", ws_required_argument, NULL, LONGOPT_SPILL_RESERVE},
         {"spill-after", ws_required_argument, NULL, LONGOPT_SPILL_AFTER},
+        {"shard-plan", ws_required_argument, NULL, LONGOPT_SHARD_PLAN},
         {0, 0, 0, 0}
     };
     bool                 arg_error = false;
@@ -1372,6 +1416,15 @@ main(int argc, char *argv[])
                 spill_after = spill_after_mb * 1024 * 1024;
                 break;
             }
+            case LONGOPT_SHARD_PLAN:
+                if (!ws_strtou32(ws_optarg, NULL, &shard_plan_shards) ||
+                        shard_plan_shards == 0) {
+                    cmdarg_err("\"%s\" isn't a valid number of workers",
+                            ws_optarg);
+                    exit_status = WS_EXIT_INVALID_OPTION;
+                    goto clean_exit;
+                }
+                break;
             case 'h':
             case 'v':
                 is_capturing = false;
@@ -1924,6 +1977,7 @@ main(int argc, char *argv[])
             case LONGOPT_SPILL_DIR:
             case LONGOPT_SPILL_RESERVE:
             case LONGOPT_SPILL_AFTER:
+            case LONGOPT_SHARD_PLAN:
                 /* already processed; just ignore it now */
                 break;
             case 'Y':
@@ -2700,6 +2754,16 @@ main(int argc, char *argv[])
             exit_status = INVALID_EXPORT;
             goto clean_exit;
         }
+    }
+
+    if (shard_plan_shards != 0) {
+        if (cf_name == NULL) {
+            cmdarg_err("--shard-plan requires a capture file");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        exit_status = print_shard_plan(cf_name, shard_plan_shards);
+        goto clean_exit;
     }
 
     if (cf_name) {

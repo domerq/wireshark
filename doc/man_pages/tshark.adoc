@@ -2500,6 +2500,27 @@ outgrows it causes another mapping of the same size to be added. Raising it
 only reduces the number of mappings.
 --
 
+--shard-plan <count>::
++
+--
+Read the capture file, work out how its packets would divide between
+__count__ workers that each dissect whole flows, print the division and
+exit. Nothing is dissected and no output is produced for the packets
+themselves.
+
+Packets are grouped by the unordered pair of IP addresses rather than by
+the 5-tuple, because IP fragments carry no ports and a 5-tuple would
+separate a fragmented datagram from its flow. Each pair goes to the worker
+with the least work assigned so far, biggest pair first. Packets with no IP
+addresses -- ARP, STP, and encapsulations this does not parse -- all go to
+worker 0.
+
+The report gives the packet count for each worker against an even division,
+which is what says whether a worker count makes sense for a capture: a
+capture dominated by one conversation cannot be divided, however many
+workers are asked for.
+--
+
 // Add a "capture-options" group for the common capture options?
 // Note a few options have different behavior in tshark, like -w,
 // because they operate on both live capture and when reading from file.
