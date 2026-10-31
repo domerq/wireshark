@@ -19,6 +19,22 @@ the difference in flow count is the per-conversation cost (~4 KB for TCP).
 whole flows. That is the input a flow-sharded parallel dissection would give
 each worker.
 
+## flow_split.py
+
+The same partitioning for a capture you already have, which is how the
+four-worker numbers in `doc/README.memory-spill` section 7 were produced:
+
+    ./flow_split.py big.pcap /tmp/shard -n 4
+    # 9530000 packets, 412390 address pairs
+    #   shard 0:    2382893 packets (1.00x ideal)
+    #   ...
+
+The key is the unordered IP address pair rather than the 5-tuple, so that IP
+fragments stay with the flow they belong to, and pairs are assigned
+longest-processing-time-first from a counting pass. Hashing the key instead
+left the busiest shard 24% above ideal at 4 ways and 72% at 16; this stays
+within 1% up to 16. Input must be pcap, not pcapng.
+
 ## Dockerfile
 
 The Linux side. Builds a tshark with the same options used for the
