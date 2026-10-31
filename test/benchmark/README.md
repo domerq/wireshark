@@ -64,8 +64,13 @@ and leaves the spilled one standing:
 
     docker run --rm --memory=1g -v wsbuild:/build -v wswork:/work \
         wireshark-bench /build/run/tshark -r /work/all.pcap --spill-dir /work \
-            -q -z conv,tcp
+            --spill-after 0 -q -z conv,tcp
     # completes; resident set stays under the limit
+
+The watermark matters here: `--spill-after` defaults to 2048 MB, so without
+it the store serves the first 2 GB from the heap and the run dies the same
+way the unmodified one does. Set it below whatever limit is being imposed,
+or to 0 to take the heap out of the picture entirely.
 
 Keep the spill directory on a volume rather than the container's writable
 layer, so that writeback is measured against a real filesystem.
@@ -99,7 +104,7 @@ Run with a budget to force the failure:
     tshark -r big.pcap -q -z conv,tcp > heap.out
     # GLib ERROR: failed to allocate 8388608 bytes - Aborting
 
-    tshark -r big.pcap --spill-dir /tmp -q -z conv,tcp > spill.out
+    tshark -r big.pcap --spill-dir /tmp --spill-after 0 -q -z conv,tcp > spill.out
     # memcap: peak heap 141 MB
     cmp heap-unconstrained.out spill.out
 
