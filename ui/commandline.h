@@ -124,6 +124,29 @@ extern void commandline_options_free(void);
 extern bool commandline_is_full_screen(void);
 
 /**
+ * @brief Directory to keep capture-lifetime dissection state in, from
+ * --spill-dir.
+ *
+ * @return The directory, or NULL to keep the state in memory.
+ */
+extern const char* commandline_get_spill_dir(void);
+
+/**
+ * @brief How much capture-lifetime dissection state to keep in RAM before
+ * spilling it to the --spill-dir file, in bytes.
+ *
+ * @return The watermark.
+ */
+extern uint64_t commandline_get_spill_after(void);
+
+/**
+ * @brief How much address space to map for --spill-dir at a time, in bytes.
+ *
+ * @return The size to map up front, and to add whenever it is used up.
+ */
+extern uint64_t commandline_get_spill_reserve(void);
+
+/**
  * @brief Get the current capture file name.
  *
  * @return The name of the current capture file.

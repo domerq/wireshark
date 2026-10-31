@@ -24,6 +24,7 @@
 
 #include <app/application_flavor.h>
 #include <wsutil/clopts_common.h>
+#include <wsutil/strtoi.h>
 #include <wsutil/cmdarg_err.h>
 #include <wsutil/filesystem.h>
 #include <wsutil/ws_assert.h>
@@ -75,9 +76,18 @@ typedef struct commandline_param_info
     bool full_screen;
     GSList* user_opts;
 
+    /* Where capture-lifetime dissection state lives; a NULL directory
+     * means the heap, as it always has. */
+    const char* spill_dir;
+    uint64_t spill_after;
+    uint64_t spill_reserve;
+
 } commandline_param_info_t;
 
-static commandline_param_info_t commandline_info;
+static commandline_param_info_t commandline_info = {
+    .spill_after   = UINT64_C(2) * 1024 * 1024 * 1024,
+    .spill_reserve = UINT64_C(64) * 1024 * 1024 * 1024,
+};
 
 capture_options global_capture_opts;
 
@@ -195,6 +205,13 @@ commandline_print_usage(commandline_usage_app_data_t* app_data, bool for_help_op
 #endif
     fprintf(output, "  --temp-dir <directory>   write temporary files to this directory\n");
     fprintf(output, "                           (default: %s)\n", g_get_tmp_dir());
+    fprintf(output, "  --spill-dir <directory>  keep capture-lifetime dissection state in a temporary file\n");
+    fprintf(output, "                           in this directory instead of in RAM, so that captures\n");
+    fprintf(output, "                           whose state exceeds memory can still be analyzed\n");
+    fprintf(output, "  --spill-after <size>     dissection state to keep in RAM before spilling, in MB\n");
+    fprintf(output, "                           (def: %" PRIu64 "MB; 0 spills everything)\n", commandline_info.spill_after / (1024 * 1024));
+    fprintf(output, "  --spill-reserve <size>   address space to map for --spill-dir at a time, in MB\n");
+    fprintf(output, "                           (def: %" PRIu64 "MB)\n", commandline_info.spill_reserve / (1024 * 1024));
     fprintf(output, "\n");
 
     ws_log_print_usage(output);
@@ -219,6 +236,9 @@ commandline_print_usage(commandline_usage_app_data_t* app_data, bool for_help_op
 
 #define LONGOPT_FULL_SCREEN     LONGOPT_BASE_GUI+1
 #define LONGOPT_CAPTURE_COMMENT LONGOPT_BASE_GUI+2
+#define LONGOPT_SPILL_DIR       LONGOPT_BASE_GUI+3
+#define LONGOPT_SPILL_RESERVE   LONGOPT_BASE_GUI+4
+#define LONGOPT_SPILL_AFTER     LONGOPT_BASE_GUI+5
 
 #define OPTSTRING OPTSTRING_CAPTURE_COMMON OPTSTRING_DISSECT_COMMON OPTSTRING_READ_CAPTURE_COMMON "C:g:HhjJ:klm:o:P:Svw:X:z:"
 static const struct ws_option long_options[] = {
@@ -226,6 +246,9 @@ static const struct ws_option long_options[] = {
         {"version", ws_no_argument, NULL, 'v'},
         {"fullscreen", ws_no_argument, NULL, LONGOPT_FULL_SCREEN },
         {"capture-comment", ws_required_argument, NULL, LONGOPT_CAPTURE_COMMENT},
+        {"spill-dir", ws_required_argument, NULL, LONGOPT_SPILL_DIR},
+        {"spill-reserve", ws_required_argument, NULL, LONGOPT_SPILL_RESERVE},
+        {"spill-after", ws_required_argument, NULL, LONGOPT_SPILL_AFTER},
         LONGOPT_CAPTURE_COMMON
         LONGOPT_DISSECT_COMMON
         LONGOPT_READ_CAPTURE_COMMON
@@ -402,6 +425,34 @@ int commandline_early_options(int argc, char *argv[], commandline_usage_app_data
                  */
                 ex_opt_add(ws_optarg);
                 break;
+            case LONGOPT_SPILL_DIR:
+                commandline_info.spill_dir = ws_optarg;
+                break;
+            case LONGOPT_SPILL_RESERVE:
+            {
+                uint64_t spill_reserve_mb;
+
+                if (!ws_strtou64(ws_optarg, NULL, &spill_reserve_mb) ||
+                        spill_reserve_mb == 0) {
+                    cmdarg_err("\"%s\" isn't a valid reserve size in MB",
+                            ws_optarg);
+                    return WS_EXIT_INVALID_OPTION;
+                }
+                commandline_info.spill_reserve = spill_reserve_mb * 1024 * 1024;
+                break;
+            }
+            case LONGOPT_SPILL_AFTER:
+            {
+                uint64_t spill_after_mb;
+
+                if (!ws_strtou64(ws_optarg, NULL, &spill_after_mb)) {
+                    cmdarg_err("\"%s\" isn't a valid amount of memory in MB",
+                            ws_optarg);
+                    return WS_EXIT_INVALID_OPTION;
+                }
+                commandline_info.spill_after = spill_after_mb * 1024 * 1024;
+                break;
+            }
             case '?':        /* Ignore errors - the "real" scan will catch them. */
                 break;
         }
@@ -711,6 +762,11 @@ void commandline_other_options(capture_options* capture_opts _U_, int argc, char
                 arg_error = true;
 #endif
                 break;
+            case LONGOPT_SPILL_DIR:
+            case LONGOPT_SPILL_RESERVE:
+            case LONGOPT_SPILL_AFTER:
+                /* Already handled before epan_init(); ignore them now. */
+                break;
             case '?':        /* Bad flag - print usage message */
             default:
                 /* wslog arguments are okay */
@@ -931,6 +987,21 @@ void commandline_options_free(void) {
 bool commandline_is_full_screen(void)
 {
     return commandline_info.full_screen;
+}
+
+const char* commandline_get_spill_dir(void)
+{
+    return commandline_info.spill_dir;
+}
+
+uint64_t commandline_get_spill_after(void)
+{
+    return commandline_info.spill_after;
+}
+
+uint64_t commandline_get_spill_reserve(void)
+{
+    return commandline_info.spill_reserve;
 }
 
 char* commandline_get_cf_name(void)

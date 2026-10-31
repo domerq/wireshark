@@ -559,6 +559,53 @@ is not.  On Windows, the __%TEMP%__ environment variable is used, which
 typically defaults to __%USERPROFILE%\AppData\Local\Temp__.
 --
 
+--spill-dir <directory>::
++
+--
+Allow the dissection state that has to live as long as the capture file is
+open -- conversations, reassembly state, per-packet protocol data, name
+resolution caches, and the per-frame index -- to overflow into a temporary
+file in __directory__ instead of failing when it no longer fits in RAM.
+
+State stays in memory until it reaches the *--spill-after* watermark, so a
+capture that fits runs at full speed and nothing is written; only the excess
+goes to the file. Pages of the file are resident while they are in use, and
+the operating system writes them back under memory pressure rather than
+failing the allocation, so a capture whose state exceeds RAM is analyzed
+slowly instead of not at all.
+
+The file is unlinked as soon as it is created, so it never appears in the
+directory listing and is reclaimed even if *Wireshark* is killed. No state
+is discarded, so results are identical to a run that keeps everything in
+memory.
+
+This does not bound what the packet list itself costs, which is about 180
+bytes per packet of Qt data structures, and reading a packet whose state
+has been written out costs a disk read, so scrolling and filtering a
+spilled capture are slower.
+--
+
+--spill-after <size>::
++
+--
+How much dissection state to keep in RAM, in MB, before *--spill-dir* starts
+using the disk (default 2048). A value of 0 sends everything to the file.
+
+The cost of spilling is proportional to how much ends up on disk, so this is
+the knob that trades speed for capacity: set it to what the machine can
+comfortably spare.
+--
+
+--spill-reserve <size>::
++
+--
+Address space, in MB, to map for *--spill-dir* up front (default 65536). It
+is not an amount of memory or of disk space that is consumed up front, since
+both the mapping and the file are sparse, and it is not a ceiling: state that
+outgrows it causes another mapping of the same size to be added. Raising it
+only reduces the number of mappings.
+--
+
 --process-info[=basic|full]::
 +
 --

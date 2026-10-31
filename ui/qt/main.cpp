@@ -37,6 +37,7 @@
 #include <wsutil/please_report_bug.h>
 #include <wsutil/unicode-utils.h>
 #include <wsutil/version_info.h>
+#include <wsutil/wmem/wmem_backing.h>
 #include <app/application_flavor.h>
 
 #include <epan/addr_resolv.h>
@@ -46,6 +47,7 @@
 #include <epan/column.h>
 #include <epan/disabled_protos.h>
 #include <epan/prefs.h>
+#include <epan/wmem_scopes.h>
 
 #ifdef HAVE_KERBEROS
 #include <epan/packet.h>
@@ -467,6 +469,7 @@ int main(int argc, char *qt_argv[])
     char                *err_str, *err_str_secondary;
 #endif
     char                *err_msg = NULL;
+    wmem_backing_t      *capture_backing = NULL;
     df_error_t          *df_err = NULL;
     e_prefs             *prefs_p;
 
@@ -731,6 +734,23 @@ int main(int argc, char *qt_argv[])
      */
     application_file_extensions(&file_extensions, &num_extensions);
     wtap_init(true, application_configuration_environment_prefix(), file_extensions, num_extensions);
+
+    if (commandline_get_spill_dir() != NULL) {
+        char *spill_err;
+
+        capture_backing = wmem_backing_file_new(commandline_get_spill_dir(),
+                commandline_get_spill_reserve(),
+                commandline_get_spill_after(), &spill_err);
+        if (capture_backing == NULL) {
+            cmdarg_err("Can't spill dissection state to \"%s\": %s",
+                    commandline_get_spill_dir(), spill_err);
+            g_free(spill_err);
+            ret_val = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        /* Must happen before epan_init() creates the scopes. */
+        wmem_set_capture_backing(capture_backing);
+    }
 
     splash_update(RA_DISSECTORS, NULL, NULL);
 #ifdef DEBUG_STARTUP_TIME
@@ -1132,6 +1152,11 @@ int main(int argc, char *qt_argv[])
     epan_cleanup();
 
     extcap_cleanup();
+
+    /* Every allocator that took its memory from the store is gone with
+     * epan_cleanup(), so the mappings can go now. */
+    wmem_backing_destroy(capture_backing);
+    capture_backing = NULL;
 
     Dot11DecryptDestroyContext(&dot11decrypt_ctx);
 
