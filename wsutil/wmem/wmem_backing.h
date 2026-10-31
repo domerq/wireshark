@@ -45,7 +45,9 @@ typedef struct _wmem_backing_t wmem_backing_t;
  * @brief Create a file-backed memory store.
  *
  * Reserves (sparsely) and maps a region of the given size out of a temporary
- * file. The file is unlinked immediately, so it occupies no name in the
+ * file, and maps another region of that size whenever the mapped ones are
+ * full, so the size given is where the store starts rather than where it
+ * stops. The file is unlinked immediately, so it occupies no name in the
  * filesystem and is reclaimed even if the process dies abnormally.
  *
  * Regions are served from the heap until @p threshold bytes are outstanding
@@ -55,9 +57,9 @@ typedef struct _wmem_backing_t wmem_backing_t;
  *
  * @param dir Directory to create the temporary file in, or NULL for the
  *            system temporary directory.
- * @param reserve Size of the address range to reserve, in bytes. This is an
- *            upper bound on the amount of memory the store can hand out, not
- *            an amount of memory or disk that is consumed up front.
+ * @param reserve Size of the address range to map up front, in bytes, and
+ *            the size to add when it is exhausted. It is not an amount of
+ *            memory or disk that is consumed up front.
  * @param threshold Bytes to keep in RAM before spilling.
  * @param err If creation fails, set to a newly allocated error string that
  *            the caller must g_free().
@@ -131,7 +133,7 @@ WS_DLL_PUBLIC
 uint64_t
 wmem_backing_bytes_high_water(const wmem_backing_t *backing);
 
-/** @brief Size of the reserved address range, in bytes. */
+/** @brief Size of the mapped address range, in bytes. It grows on demand. */
 WS_DLL_PUBLIC
 uint64_t
 wmem_backing_bytes_reserved(const wmem_backing_t *backing);

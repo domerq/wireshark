@@ -2493,10 +2493,11 @@ capture.
 --spill-reserve <size>::
 +
 --
-Address space, in MB, to reserve for *--spill-dir* (default 65536). This is an
-upper bound on how much dissection state a run can hold; it is not an amount
-of memory or of disk space that is consumed up front, since both the mapping
-and the file are sparse.
+Address space, in MB, to map for *--spill-dir* up front (default 65536). It
+is not an amount of memory or of disk space that is consumed up front, since
+both the mapping and the file are sparse, and it is not a ceiling: state that
+outgrows it causes another mapping of the same size to be added. Raising it
+only reduces the number of mappings.
 --
 
 // Add a "capture-options" group for the common capture options?
