@@ -161,6 +161,49 @@ class TestTsharkCaptureClopts:
         assert grep_output(process.stderr, 'There is no interface with that adapter index')
 
 
+class TestTsharkShardPlan:
+    @staticmethod
+    def parse_plan(output):
+        '''(total, pairs, unkeyed, [packets per shard]) from --shard-plan.'''
+        lines = output.splitlines()
+        head = lines[0].split()
+        counts = [int(line.split()[2]) for line in lines[1:] if line.strip()]
+        return int(head[0]), int(head[2]), int(head[5]), counts
+
+    def test_tshark_shard_plan_accounts_for_every_packet(self, cmd_tshark, capture_file, test_env):
+        '''Every packet is assigned to exactly one worker'''
+        for shards in (1, 3, 8):
+            process = subprocesstest.run((cmd_tshark,
+                '-r', capture_file('dhcp.pcap'), '--shard-plan', str(shards),
+            ), capture_output=True, env=test_env)
+            assert process.returncode == 0
+            total, _, _, counts = self.parse_plan(process.stdout)
+            assert len(counts) == shards
+            assert sum(counts) == total
+
+    def test_tshark_shard_plan_is_deterministic(self, cmd_tshark, capture_file, test_env):
+        '''Workers must agree on the plan, so it cannot depend on hash order'''
+        runs = [subprocesstest.run((cmd_tshark,
+            '-r', capture_file('http.pcap'), '--shard-plan', '4',
+        ), capture_output=True, env=test_env).stdout for _ in range(3)]
+        assert runs[0] == runs[1] == runs[2]
+
+    def test_tshark_shard_plan_keeps_a_flow_whole(self, cmd_tshark, capture_file, test_env):
+        '''A capture of one conversation cannot be divided'''
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('http.pcap'), '--shard-plan', '4',
+        ), capture_output=True, env=test_env)
+        total, pairs, _, counts = self.parse_plan(process.stdout)
+        assert pairs == 1
+        assert sorted(counts) == [0, 0, 0, total]
+
+    def test_tshark_shard_plan_rejects_zero(self, cmd_tshark, capture_file, test_env):
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('http.pcap'), '--shard-plan', '0',
+        ), capture_output=True, env=test_env)
+        assert process.returncode == ExitCodes.COMMAND_LINE
+
+
 class TestTsharkNameResolutionClopts:
     def test_tshark_valid_name_resolution(self, cmd_tshark, capture_file, test_env):
         # $TSHARK -N mnNtdv -a duration:1 > ./testout.txt 2>&1
