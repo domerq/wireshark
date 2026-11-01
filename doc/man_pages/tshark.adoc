@@ -2549,7 +2549,7 @@ prints. That doubles the dissection work, so summary output, which never
 shows such a field, skips it.
 
 This option works on a capture file only. It is refused with *-w*,
-*--export-pdu*, *-q*, *-2*, *-z*, *-T json*, *-T jsonraw*, and read or
+*--export-pdu*, *-q*, *-z*, *-T json*, *-T jsonraw*, and read or
 display filters, because the result would not be the result of a
 single-process run: statistics would cover one worker's flows, the JSON
 writer puts separators between elements as it goes so the pieces cannot
