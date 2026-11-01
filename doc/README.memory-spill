@@ -220,6 +220,11 @@ sub-arena, so a cold flow's state is page-contiguous and faults back as one
 unit; that also makes explicit LRU eviction of idle flows possible, which
 would subsume -M without discarding anything that is still reachable.
 
+Flow sharding attacks the same locality problem from the other side, by
+making each process's arena smaller, and --jobs now does it: see
+README.flow-sharding. With --jobs every worker gets a store of its own
+and divides the --spill-after watermark between them.
+
 GUI. Wireshark takes the same three options and creates the store where
 TShark does, before epan_init() in ui/qt/main.cpp, and needs nothing else.
 Random access to an arbitrary packet does not need dissection state as of

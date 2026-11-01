@@ -1,0 +1,167 @@
+Dissecting a capture in several processes
+=========================================
+
+This document describes why and how TShark can dissect one capture file in
+several processes (the --jobs option), what it refuses to do and why, and
+what it costs. For the mechanics of the planner see flow_shard.h; for the
+other half of the large-capture problem see README.memory-spill.
+
+1. The problem
+--------------
+
+Dissection is single threaded. A capture that takes a minute to analyze
+takes a minute on a 10-core machine, and the only way to use the rest of
+the machine is to split the file by hand - which splits flows, and so
+changes the results.
+
+2. Why processes
+----------------
+
+Dissection is not re-entrant and cannot be made so at a reasonable cost:
+
+  - 574+ dissector source files carry mutable file-scope statics;
+  - the wmem scopes are process globals (wmem_scopes.c still carries a
+    "TODO: Make these thread-local");
+  - the tap queue is a global array;
+  - libgcrypt's initialisation is documented as not thread safe.
+
+Auditing 3000 dissectors for re-entrancy is not a project anyone would
+finish. fork() gives isolation for nothing, and forking after epan_init()
+means the ~91 MB of registration tables are built once and shared
+copy-on-write.
+
+3. The division
+---------------
+
+Packets are grouped by the unordered pair of IP addresses. Not by the
+5-tuple: IP fragments carry no ports, so a 5-tuple key would put a
+fragmented datagram in a different worker from the flow it belongs to.
+Everything that dissection accumulates - conversations, TCP sequence
+analysis, reassembly - is then confined to one worker.
+
+Pairs are assigned longest-processing-time-first: biggest pair to the
+worker with the least work so far. Hashing the key instead leaves the
+busiest worker 24% above ideal at 4 ways on real traffic and 72% at 16,
+because flow sizes are nothing like uniform; the greedy assignment stays
+within 1% up to 16 ways. That is why there is an index pass at all: the
+assignment needs the counts.
+
+Ties break on the key, so every process that plans the same capture gets
+the same plan - the workers never compare notes.
+
+Packets with no IP addresses - ARP, STP, and encapsulations the planner
+does not parse - go to worker 0. On real traffic that is a few percent.
+
+--shard-plan prints the division without dissecting anything, which is how
+to tell whether a capture can be divided at all.
+
+4. The workers
+--------------
+
+The parent builds the plan, creates two unlinked spool files per worker
+and forks. Each worker reads the whole file, dissects and prints only the
+packets the plan gives it into its output spool, and records (frame
+number, offset, length) for each packet in its index spool. The parent
+writes the preamble, walks the indexes in frame number order copying
+bytes out of the spools, and writes the finale.
+
+So the merge knows nothing about output formats: it moves the bytes a
+packet produced, whatever they are.
+
+A packet another worker owns still advances the state later packets are
+printed relative to, so a worker keeps the frame numbering, the time
+reference, the previous frame and the cumulative byte count up to date
+for packets it never dissects (jobs_skip_packet() in tshark.c). Without
+that, every time column would be measured from each worker's own first
+packet.
+
+5. What it refuses
+------------------
+
+Only cases where the output would match a single-process run are
+accepted. The rest are refused rather than approximated:
+
+    -z                  tap accumulators would cover one worker's flows.
+                        Folding them back together is per-tap work.
+    -V, -T pdml/json/ek Conversation index fields - tcp.stream and the
+                        rest - are numbered in conversation creation
+                        order, which in a worker is the order of its own
+                        flows. Summary columns do not carry them.
+    -Y, -R              A worker cannot know whether a packet it never
+                        dissected would have passed a filter, so columns
+                        measured from the previous displayed packet would
+                        be measured from the wrong one.
+    -w, --export-pdu    There would be nothing to merge in frame order.
+    -q                  Likewise.
+    -2                  Not implemented.
+    Windows             No fork().
+
+6. What it cannot refuse
+------------------------
+
+Traffic set up by signalling carried on a different flow is dissected as
+whatever it looks like on its own when the signalling went to another
+worker. RTP announced in SDP is the usual case: of the 254 captures in
+test/captures, 253 are byte-identical at 3 workers and sip-rtp.pcapng is
+not, because the media and the signalling are different address pairs and
+the media worker never saw the SDP.
+
+The same shape of hazard exists for ICMP errors referring to another
+flow, TLS session resumption through the global key map, and names
+learned from DNS. Nothing in a plan built before dissection can know
+about those relationships, so --jobs says on stderr that it dissects
+flows independently rather than quietly differing.
+
+7. Cost
+-------
+
+A real 526 MB capture, 749 804 packets, 669 address pairs, summary output:
+
+    workers    wall    note
+    1          4.25 s
+    2          3.31 s
+    4          2.55 s
+    8          2.61 s  no further gain
+
+The ceiling is the biggest flow: one conversation here is 36% of the
+packets, so no division can beat 2.75x, and --shard-plan says so before
+the run. Each worker also reads the whole file, and the index pass reads
+it once more.
+
+With everything spilled to disk (--spill-dir, --spill-after 0) the same
+capture takes 4.23 s serially and 2.56 s with 4 workers, output identical
+to an unspilled run in both cases. Sharding and spilling help each other:
+each worker holds a fraction of the state (176, 200, 419 and 924 MB here,
+against 1528 MB in one process), and a smaller arena is a warmer one.
+
+8. Limits and next steps
+------------------------
+
+Global conversation numbering. This is what blocks -V and the structured
+output formats, which is most of what TShark is used for. A worker would
+have to know the rank of a conversation among all of the capture's
+conversations, which means the index pass would have to enumerate
+conversations the way the dissectors key them, not just address pairs.
+
+Mergeable taps. -z could be supported for the accumulators that fold -
+conversations, endpoints - with a capability flag on the tap, and
+refused for the ones that do not (stats_tree burst rates, io_graph
+frame-number tie-breaks).
+
+Filters, two-pass, and JSON. A display filter needs the previous
+displayed frame, which needs either an extra pass or a different
+definition of the delta columns. JSON needs the workers to emit elements
+that can be concatenated.
+
+Affinity. The v2 answer to section 6 is to let a worker that discovers a
+relationship - SDP announcing a media address - hand that flow to the
+worker that owns the signalling, which means the plan has to be
+adjustable while the run is in progress.
+
+9. Reproducing the measurements
+-------------------------------
+
+test/benchmark/gen_pcap.py generates captures with an exact packet and
+flow count; test/benchmark/flow_split.py splits a real capture into
+flow-disjoint files, which is what the measurements that predate --jobs
+used. See test/benchmark/README.md.
