@@ -58,6 +58,42 @@ flow_shard_plan_new(const char *filename, unsigned shards, int *err,
         char **err_info);
 
 /**
+ * @brief Build a plan, choosing how many workers to use.
+ *
+ * How much a capture can be divided is a property of the capture, not of
+ * the machine: one conversation that is a third of the packets caps the
+ * speedup at three however many workers are started. This reads the file
+ * once, as flow_shard_plan_new() does, then tries every worker count up
+ * to @p max_shards and keeps the smallest one that gets within a little
+ * of the best division any of them manage, so that no process is started
+ * for work that is not there.
+ *
+ * @param filename The capture file to plan for.
+ * @param max_shards The most workers to consider.
+ * @param err Set to a wiretap error code if the file could not be opened
+ *            or could not be read to the end.
+ * @param err_info Set to a newly allocated error string, which the caller
+ *            must g_free(), if the file could not be opened.
+ * @return The plan, or NULL if the file could not be opened. Ask it how
+ *         many workers it chose with flow_shard_plan_shards().
+ */
+flow_shard_plan_t *
+flow_shard_plan_new_auto(const char *filename, unsigned max_shards,
+        int *err, char **err_info);
+
+/**
+ * @brief The best speedup this division can give.
+ *
+ * The packets divided by the busiest worker's share: a plan that gives
+ * one worker a third of the packets cannot go faster than 3.
+ *
+ * @param plan The plan.
+ * @return The ratio, 1.0 for a single worker.
+ */
+double
+flow_shard_plan_speedup(const flow_shard_plan_t *plan);
+
+/**
  * @brief Free a plan.
  *
  * @param plan The plan, or NULL.

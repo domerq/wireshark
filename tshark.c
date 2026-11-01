@@ -155,6 +155,7 @@
 #define LONGOPT_SPILL_AFTER             LONGOPT_BASE_APPLICATION+15
 #define LONGOPT_SHARD_PLAN              LONGOPT_BASE_APPLICATION+16
 #define LONGOPT_JOBS                    LONGOPT_BASE_APPLICATION+17
+#define LONGOPT_PARALLEL                LONGOPT_BASE_APPLICATION+18
 
 capture_file cfile;
 
@@ -179,6 +180,16 @@ static unsigned shard_plan_shards;
  * it owns, into a spool file, recording where each packet's output
  * landed. The parent writes the spools out in frame number order, which
  * is the order one process would have printed them in. */
+/* A --jobs with no count: the plan picks how many workers to start. */
+#define JOBS_AUTO UINT_MAX
+/* What --parallel has to expect before it starts any workers. Forking,
+ * reading the file once per worker and copying every worker's output
+ * through the parent all cost something, and the estimate itself is
+ * only a count of packets. Measured: a capture whose estimate was 1.4x
+ * came out slower than one process, and one at 2.8x came out 1.5x
+ * faster, so the estimate has to be comfortably above 1 to be worth
+ * acting on. */
+#define JOBS_WORTH_IT 2.0
 static unsigned jobs;
 static flow_shard_plan_t *jobs_plan;
 static unsigned jobs_shard;
@@ -1246,13 +1257,45 @@ jobs_fork(const char *filename, unsigned count, bool need_first_pass,
     unsigned       i;
     bool           failed = false;
     int            status_from_worker = EXIT_SUCCESS;
+    bool           chosen = (count == JOBS_AUTO);
+    double         speedup;
 
-    jobs_plan = flow_shard_plan_new(filename, count, &err, &err_info);
+    if (chosen) {
+        /* The capture decides: as many workers as its flows can keep
+         * busy, and no more than this machine has processors. */
+        jobs_plan = flow_shard_plan_new_auto(filename,
+                (unsigned)g_get_num_processors(), &err, &err_info);
+    }
+    else {
+        jobs_plan = flow_shard_plan_new(filename, count, &err, &err_info);
+    }
     if (jobs_plan == NULL) {
         report_cfile_open_failure(filename, err, err_info);
         *exit_status = WS_EXIT_INVALID_FILE;
         return false;
     }
+
+    /* What the division is worth: the busiest worker bounds it, and
+     * output that shows a conversation index needs a pass to work the
+     * numbering out, so the work is done twice. */
+    speedup = flow_shard_plan_speedup(jobs_plan) / (need_first_pass ? 2 : 1);
+    count   = flow_shard_plan_shards(jobs_plan);
+
+    if (chosen && (count == 1 || speedup < JOBS_WORTH_IT)) {
+        /* Not worth the processes: a capture dominated by one
+         * conversation cannot be divided, and a division that has to be
+         * dissected twice has to halve the work to break even. */
+        cmdarg_err_cont("tshark: --parallel: dissecting in one process; "
+                "the best division of this capture is worth %.1fx",
+                speedup);
+        flow_shard_plan_free(jobs_plan);
+        jobs_plan = NULL;
+        *exit_status = EXIT_SUCCESS;
+        return true;
+    }
+
+    cmdarg_err_cont("tshark: --jobs: %u workers, at best %.1fx faster",
+            count, speedup);
 
     workers = g_new0(jobs_worker_t, count);
 
@@ -1616,14 +1659,17 @@ print_usage(FILE *output)
     fprintf(output, "  --spill-dir <directory>  keep capture-lifetime dissection state in a temporary file\n");
     fprintf(output, "                           in this directory instead of in RAM, so that captures\n");
     fprintf(output, "                           whose state exceeds memory can still be analyzed\n");
-    fprintf(output, "  --spill-after <size>     dissection state to keep in RAM before spilling, in MB\n");
+    fprintf(output, "  --spill-after <size>     dissection state to keep in RAM before spilling; a plain\n");
+    fprintf(output, "                           number is MB, or use K/M/G/T\n");
     fprintf(output, "                           (def: %" PRIu64 "MB; 0 spills everything)\n", spill_after / (1024 * 1024));
     fprintf(output, "  --spill-reserve <size>   address space to map for --spill-dir at a time, in MB\n");
+    fprintf(output, "                           or K/M/G/T\n");
     fprintf(output, "                           (def: %" PRIu64 "MB)\n", spill_reserve / (1024 * 1024));
     fprintf(output, "  --shard-plan <count>     print how this capture would divide between <count>\n");
     fprintf(output, "                           workers that each dissect whole flows, and exit\n");
-    fprintf(output, "  --jobs <count>           dissect the capture in <count> processes, each taking\n");
-    fprintf(output, "                           whole flows (def: 1)\n");
+    fprintf(output, "  --parallel               dissect the capture in several processes, each taking\n");
+    fprintf(output, "                           whole flows, as many as the capture can keep busy\n");
+    fprintf(output, "  --jobs <count>           as --parallel, with the number of processes given\n");
     fprintf(output, "\n");
 
     ws_log_print_usage(output);
@@ -2124,6 +2170,7 @@ main(int argc, char *argv[])
         {"spill-after", ws_required_argument, NULL, LONGOPT_SPILL_AFTER},
         {"shard-plan", ws_required_argument, NULL, LONGOPT_SHARD_PLAN},
         {"jobs", ws_required_argument, NULL, LONGOPT_JOBS},
+        {"parallel", ws_no_argument, NULL, LONGOPT_PARALLEL},
         {0, 0, 0, 0}
     };
     bool                 arg_error = false;
@@ -2352,32 +2399,21 @@ main(int argc, char *argv[])
                 spill_dir = ws_optarg;
                 break;
             case LONGOPT_SPILL_RESERVE:
-            {
-                uint64_t spill_reserve_mb;
-
-                if (!ws_strtou64(ws_optarg, NULL, &spill_reserve_mb) ||
-                        spill_reserve_mb == 0) {
-                    cmdarg_err("\"%s\" isn't a valid reserve size in MB",
-                            ws_optarg);
+                if (!ws_parse_size(ws_optarg, 1024 * 1024, &spill_reserve) ||
+                        spill_reserve == 0) {
+                    cmdarg_err("\"%s\" isn't a valid reserve size", ws_optarg);
                     exit_status = WS_EXIT_INVALID_OPTION;
                     goto clean_exit;
                 }
-                spill_reserve = spill_reserve_mb * 1024 * 1024;
                 break;
-            }
             case LONGOPT_SPILL_AFTER:
-            {
-                uint64_t spill_after_mb;
-
-                if (!ws_strtou64(ws_optarg, NULL, &spill_after_mb)) {
-                    cmdarg_err("\"%s\" isn't a valid amount of memory in MB",
+                if (!ws_parse_size(ws_optarg, 1024 * 1024, &spill_after)) {
+                    cmdarg_err("\"%s\" isn't a valid amount of memory",
                             ws_optarg);
                     exit_status = WS_EXIT_INVALID_OPTION;
                     goto clean_exit;
                 }
-                spill_after = spill_after_mb * 1024 * 1024;
                 break;
-            }
             case LONGOPT_SHARD_PLAN:
                 if (!ws_strtou32(ws_optarg, NULL, &shard_plan_shards) ||
                         shard_plan_shards == 0) {
@@ -2386,6 +2422,14 @@ main(int argc, char *argv[])
                     exit_status = WS_EXIT_INVALID_OPTION;
                     goto clean_exit;
                 }
+                break;
+            case LONGOPT_PARALLEL:
+                jobs = JOBS_AUTO;
+#ifdef _WIN32
+                cmdarg_err("--parallel is not supported on this platform");
+                exit_status = WS_EXIT_INVALID_OPTION;
+                goto clean_exit;
+#endif
                 break;
             case LONGOPT_JOBS:
                 if (!ws_strtou32(ws_optarg, NULL, &jobs) || jobs == 0) {
@@ -2957,6 +3001,7 @@ main(int argc, char *argv[])
             case LONGOPT_SPILL_AFTER:
             case LONGOPT_SHARD_PLAN:
             case LONGOPT_JOBS:
+            case LONGOPT_PARALLEL:
                 /* already processed; just ignore it now */
                 break;
             case 'Y':

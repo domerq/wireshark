@@ -234,6 +234,16 @@ class TestTsharkJobs:
                         'tshark --jobs %s differs with %s' % (
                                 workers, ' '.join(extra) or 'summary output')
 
+    def test_tshark_parallel_picks_a_worker_count(self, cmd_tshark, capture_file, test_env):
+        '''--parallel works out how many processes to use, and says so'''
+        serial = self.summary(cmd_tshark, capture_file, test_env)
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('dns-mdns.pcap'), '--parallel',
+        ), capture_output=True, env=test_env)
+        assert process.returncode == 0
+        assert process.stdout == serial
+        assert grep_output(process.stderr, 'workers|one process')
+
     def test_tshark_jobs_refuses_what_it_cannot_merge(self, cmd_tshark, capture_file, test_env):
         '''Options whose results would differ are refused, not approximated'''
         for extra in (('-T', 'json'), ('-q', '-z', 'io,stat,1'),
