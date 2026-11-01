@@ -587,6 +587,7 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
     char          *err_info = NULL;
     unsigned       i;
     bool           failed = false;
+    int            status_from_worker;
 
     jobs_plan = flow_shard_plan_new(filename, count, &err, &err_info);
     if (jobs_plan == NULL) {
@@ -652,6 +653,11 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
         workers[i].pid = pid;
     }
 
+    /* A worker that stopped on a bad file has still printed the packets
+     * it got through, exactly as a single process would have, so its
+     * status is passed on rather than replaced and its output is still
+     * written out. */
+    status_from_worker = EXIT_SUCCESS;
     for (i = 0; i < count; i++) {
         int status = 0;
 
@@ -665,9 +671,7 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
             failed = true;
         }
         else if (WEXITSTATUS(status) != EXIT_SUCCESS) {
-            cmdarg_err("Worker %u exited with status %d", i,
-                    WEXITSTATUS(status));
-            failed = true;
+            status_from_worker = WEXITSTATUS(status);
         }
     }
 
@@ -685,7 +689,7 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
         cfile.filename = NULL;
     }
 
-    *exit_status = failed ? WS_EXIT_INVALID_FILE : EXIT_SUCCESS;
+    *exit_status = failed ? WS_EXIT_INVALID_FILE : status_from_worker;
 
 fail:
     for (i = 0; i < count; i++) {
@@ -3152,6 +3156,15 @@ main(int argc, char *argv[])
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
+
+        /* A flow that is set up by signalling carried on a different
+         * flow - RTP announced in SDP is the usual case - is dissected
+         * as whatever it looks like on its own when the signalling went
+         * to another worker. Nothing in the plan can know about those
+         * relationships, so say so rather than quietly differ. */
+        cmdarg_err_cont("tshark: --jobs dissects flows independently, so "
+                "traffic set up by signalling on another flow (RTP from "
+                "SDP, for example) may be dissected differently");
 
         if (!jobs_fork(cf_name, jobs, (int *)&exit_status)) {
             goto clean_exit;

@@ -264,10 +264,12 @@ flow_shard_plan_new(const char *filename, unsigned shards, int *err,
     wtap_rec_cleanup(&rec);
     wtap_close(wth);
 
-    if (*err != 0) {
-        flow_shard_plan_free(plan);
-        return NULL;
-    }
+    /* A file that stops in the middle of a packet still has a plan for
+     * the part that is there: the workers will reach the same point and
+     * report the same error as a single process would. *err is left set
+     * for a caller that wants to know. */
+    g_free(*err_info);
+    *err_info = NULL;
 
     /* The unkeyed packets are worker 0's before any flow is. */
     plan->shard_packets[0] = plan->unkeyed;
