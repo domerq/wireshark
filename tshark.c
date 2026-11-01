@@ -60,6 +60,7 @@
 
 #include "globals.h"
 #include "flow_shard.h"
+#include <epan/ordinal.h>
 #include <epan/timestamp.h>
 #include <epan/packet.h>
 #ifdef HAVE_LUA
@@ -181,6 +182,7 @@ static unsigned jobs;
 static flow_shard_plan_t *jobs_plan;
 static unsigned jobs_shard;
 static FILE *jobs_index_fp;
+static unsigned jobs_pass;
 static bool stats_requested;
 
 static uint32_t selected_frame_number;
@@ -420,14 +422,89 @@ typedef struct {
     uint64_t length;
 } jobs_index_entry_t;
 
+/* Pass one of a sharded run records, in creation order, the frame that
+ * each ordinal - a conversation index, a tcp.stream and so on - was
+ * created for. The parent then knows the order the whole capture would
+ * have created them in, and pass two hands out those values. */
+typedef struct {
+    uint32_t frame;
+    uint32_t value;             /* pass one: counter id; pass two: value */
+    uint64_t identity;          /* pass one only; 0 when unique to one */
+} jobs_ordinal_record_t;
+
 typedef struct {
     pid_t pid;
     int   out_fd;
     int   idx_fd;
+    int   ord_fd;               /* ordinals: recorded, then handed back */
+    int   names_fd;             /* counter id -> counter name */
     FILE *idx_fp;               /* parent side, for reading back */
     jobs_index_entry_t entry;
     bool  have_entry;
 } jobs_worker_t;
+
+/* Worker side. */
+static FILE       *jobs_ordinal_fp;     /* pass one: where events go */
+static FILE       *jobs_names_fp;       /* pass one: the counter names */
+static GPtrArray  *jobs_ordinal_names;
+static GArray     *jobs_ordinal_local;
+static jobs_ordinal_record_t *jobs_ordinal_values;  /* pass two */
+static size_t      jobs_ordinal_count;
+static size_t      jobs_ordinal_pos;
+
+/* Pass one: note that this counter produced a value for this frame, and
+ * hand out the value a single process would have handed out for its own
+ * flows. Nothing is printed in this pass, so the value only has to be
+ * consistent, not correct. */
+static uint32_t
+jobs_ordinal_collect(const char *name, int *id, uint32_t frame,
+        uint64_t identity, void *user _U_)
+{
+    jobs_ordinal_record_t rec;
+
+    if (*id < 0) {
+        uint32_t zero = 0;
+
+        *id = (int)jobs_ordinal_names->len;
+        g_ptr_array_add(jobs_ordinal_names, (void *)name);
+        g_array_append_val(jobs_ordinal_local, zero);
+        fprintf(jobs_names_fp, "%d %s\n", *id, name);
+    }
+
+    rec.frame    = frame;
+    rec.value    = (uint32_t)*id;
+    rec.identity = identity;
+    if (fwrite(&rec, sizeof(rec), 1, jobs_ordinal_fp) != 1) {
+        cmdarg_err("Can't record ordinals: %s", g_strerror(errno));
+        exit(WS_EXIT_INVALID_FILE);
+    }
+
+    return g_array_index(jobs_ordinal_local, uint32_t, *id)++;
+}
+
+/* Pass two: hand back the values the parent worked out. The frames are
+ * checked as they go, so a dissection that took a different path in the
+ * second pass is a loud failure rather than quietly different output. */
+static uint32_t
+jobs_ordinal_replay(const char *name, int *id _U_, uint32_t frame,
+        uint64_t identity _U_, void *user _U_)
+{
+    jobs_ordinal_record_t rec;
+
+    if (jobs_ordinal_pos >= jobs_ordinal_count) {
+        ws_error("worker ran out of ordinals for %s at frame %u", name,
+                frame);
+    }
+
+    rec = jobs_ordinal_values[jobs_ordinal_pos++];
+    if (rec.frame != frame) {
+        ws_error("worker wanted an ordinal for %s at frame %u, but the "
+                "first pass created one at frame %u", name, frame,
+                rec.frame);
+    }
+
+    return rec.value;
+}
 
 /* An unlinked temporary file: the workers inherit the descriptor, the
  * parent reads it back, and nothing has to clean up after a crash. */
@@ -572,22 +649,373 @@ jobs_merge(jobs_worker_t *workers, unsigned count)
     return true;
 }
 
+/* Read back what one worker recorded in pass one: which counter each
+ * ordinal belonged to, in creation order. */
+static bool
+jobs_read_ordinals(jobs_worker_t *worker, GHashTable *names,
+        GPtrArray *name_list, GArray **events, GArray **ids,
+        GArray **identities)
+{
+    jobs_ordinal_record_t rec;
+    GArray  *local_to_global;
+    FILE    *fp;
+    char     line[256];
+
+    /* The names this worker saw, in the order it first saw them. */
+    local_to_global = g_array_new(FALSE, FALSE, sizeof(unsigned));
+    if (lseek(worker->names_fd, 0, SEEK_SET) == (off_t)-1) {
+        g_array_free(local_to_global, TRUE);
+        return false;
+    }
+    fp = fdopen(dup(worker->names_fd), "rb");
+    if (fp == NULL) {
+        g_array_free(local_to_global, TRUE);
+        return false;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char    *name = strchr(line, ' ');
+        unsigned global;
+        void    *found;
+
+        if (name == NULL) {
+            continue;
+        }
+        name++;
+        g_strchomp(name);
+
+        if (g_hash_table_lookup_extended(names, name, NULL, &found)) {
+            global = GPOINTER_TO_UINT(found);
+        }
+        else {
+            global = name_list->len;
+            g_ptr_array_add(name_list, g_strdup(name));
+            g_hash_table_insert(names, g_strdup(name),
+                    GUINT_TO_POINTER(global));
+        }
+        g_array_append_val(local_to_global, global);
+    }
+    fclose(fp);
+
+    /* The events themselves. */
+    *events     = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    *ids        = g_array_new(FALSE, FALSE, sizeof(unsigned));
+    *identities = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    if (lseek(worker->ord_fd, 0, SEEK_SET) == (off_t)-1) {
+        g_array_free(local_to_global, TRUE);
+        return false;
+    }
+    fp = fdopen(dup(worker->ord_fd), "rb");
+    if (fp == NULL) {
+        g_array_free(local_to_global, TRUE);
+        return false;
+    }
+    while (fread(&rec, sizeof(rec), 1, fp) == 1) {
+        unsigned global;
+
+        if (rec.value >= local_to_global->len) {
+            fclose(fp);
+            g_array_free(local_to_global, TRUE);
+            return false;
+        }
+        global = g_array_index(local_to_global, unsigned, rec.value);
+        g_array_append_val(*events, rec.frame);
+        g_array_append_val(*ids, global);
+        g_array_append_val(*identities, rec.identity);
+    }
+    fclose(fp);
+    g_array_free(local_to_global, TRUE);
+
+    return true;
+}
+
+/* The value for one request: the same as the last time this identity was
+ * numbered, if it has been, since several workers can be numbering the
+ * same thing - a conversation between two MAC addresses is not confined
+ * to one flow, and each worker that sees it creates its own. */
+static uint32_t
+jobs_ordinal_value(GHashTable *shared, unsigned id, uint64_t identity,
+        GArray *next_value)
+{
+    uint64_t key;
+    void    *found;
+    uint32_t value;
+
+    if (identity != 0) {
+        key = identity ^ ((uint64_t)id << 56);
+        if (g_hash_table_lookup_extended(shared, &key, NULL, &found)) {
+            return GPOINTER_TO_UINT(found);
+        }
+    }
+
+    value = g_array_index(next_value, uint32_t, id)++;
+
+    if (identity != 0) {
+        uint64_t *stored = g_new(uint64_t, 1);
+
+        *stored = key;
+        g_hash_table_insert(shared, stored, GUINT_TO_POINTER(value));
+    }
+
+    return value;
+}
+
+
 /*
- * Run the capture file across several processes, each dissecting whole
- * flows. Returns true in a worker, which then reads the file as usual
- * with its output going to a spool; returns false in the parent once the
- * workers are done and their output has been written out, with the exit
- * status in *exit_status.
+ * Work out, from what the workers recorded, the values a single process
+ * would have handed out, and give each worker its own values back in the
+ * order it will ask for them.
+ *
+ * Each worker created its ordinals in frame order, and no two workers
+ * share a frame, so merging the workers by frame number reconstructs the
+ * order of the capture as a whole.
  */
 static bool
-jobs_fork(const char *filename, unsigned count, int *exit_status)
+jobs_merge_ordinals(jobs_worker_t *workers, unsigned count)
+{
+    GHashTable *names;
+    GHashTable *shared;
+    GPtrArray  *name_list;
+    GArray    **events, **ids, **identities, **out;
+    unsigned   *cursor;
+    GArray     *next_value;
+    unsigned    i;
+    bool        ok = true;
+
+    names      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    shared     = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
+            NULL);
+    name_list  = g_ptr_array_new_with_free_func(g_free);
+    events     = g_new0(GArray *, count);
+    ids        = g_new0(GArray *, count);
+    identities = g_new0(GArray *, count);
+    out        = g_new0(GArray *, count);
+    cursor     = g_new0(unsigned, count);
+    next_value = g_array_new(FALSE, TRUE, sizeof(uint32_t));
+
+    for (i = 0; i < count; i++) {
+        if (!jobs_read_ordinals(&workers[i], names, name_list, &events[i],
+                    &ids[i], &identities[i])) {
+            ok = false;
+            goto out;
+        }
+        out[i] = g_array_new(FALSE, FALSE, sizeof(jobs_ordinal_record_t));
+    }
+
+    g_array_set_size(next_value, name_list->len);
+
+    for (;;) {
+        unsigned best = count;
+        uint32_t best_frame = 0;
+        jobs_ordinal_record_t rec;
+        unsigned id;
+
+        for (i = 0; i < count; i++) {
+            uint32_t frame;
+
+            if (cursor[i] >= events[i]->len) {
+                continue;
+            }
+            frame = g_array_index(events[i], uint32_t, cursor[i]);
+            if (best == count || frame < best_frame) {
+                best       = i;
+                best_frame = frame;
+            }
+        }
+        if (best == count) {
+            break;
+        }
+
+        id        = g_array_index(ids[best], unsigned, cursor[best]);
+        rec.frame    = best_frame;
+        rec.identity = 0;
+        rec.value    = jobs_ordinal_value(shared, id,
+                g_array_index(identities[best], uint64_t, cursor[best]),
+                next_value);
+        g_array_append_val(out[best], rec);
+        cursor[best]++;
+    }
+
+    /* Hand each worker its values back through the same spool. */
+    for (i = 0; i < count; i++) {
+        ssize_t want = (ssize_t)(out[i]->len * sizeof(jobs_ordinal_record_t));
+
+        if (ftruncate(workers[i].ord_fd, 0) != 0 ||
+                lseek(workers[i].ord_fd, 0, SEEK_SET) == (off_t)-1 ||
+                write(workers[i].ord_fd, out[i]->data, (size_t)want) != want) {
+            ok = false;
+            goto out;
+        }
+    }
+
+out:
+    for (i = 0; i < count; i++) {
+        if (events[i] != NULL) {
+            g_array_free(events[i], TRUE);
+        }
+        if (ids[i] != NULL) {
+            g_array_free(ids[i], TRUE);
+        }
+        if (identities[i] != NULL) {
+            g_array_free(identities[i], TRUE);
+        }
+        if (out[i] != NULL) {
+            g_array_free(out[i], TRUE);
+        }
+    }
+    g_free(events);
+    g_free(ids);
+    g_free(identities);
+    g_free(out);
+    g_free(cursor);
+    g_array_free(next_value, TRUE);
+    g_ptr_array_free(name_list, TRUE);
+    g_hash_table_destroy(names);
+    g_hash_table_destroy(shared);
+
+    return ok;
+}
+
+/* Worker side of starting a pass: take over the spools. */
+static void
+jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
+        unsigned pass)
+{
+    jobs_shard = shard;
+    jobs_pass  = pass;
+
+    if (pass == 1) {
+        /* Nothing is printed in this pass; it exists to find out which
+         * ordinals the capture creates and in what order. */
+        jobs_ordinal_names = g_ptr_array_new();
+        jobs_ordinal_local = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+        jobs_ordinal_fp    = fdopen(worker->ord_fd, "wb");
+        jobs_names_fp      = fdopen(worker->names_fd, "wb");
+        if (jobs_ordinal_fp == NULL || jobs_names_fp == NULL) {
+            cmdarg_err("Worker %u can't use its spool: %s", shard,
+                    g_strerror(errno));
+            exit(WS_EXIT_INIT_FAILED);
+        }
+        ordinal_set_provider(jobs_ordinal_collect, NULL);
+        print_packet_info = false;
+    }
+    else {
+        struct stat st;
+
+        if (fstat(worker->ord_fd, &st) == 0 && st.st_size > 0) {
+            ssize_t got;
+
+            jobs_ordinal_count = (size_t)st.st_size /
+                sizeof(jobs_ordinal_record_t);
+            jobs_ordinal_values = (jobs_ordinal_record_t *)
+                g_malloc((size_t)st.st_size);
+            got = pread(worker->ord_fd, jobs_ordinal_values,
+                    (size_t)st.st_size, 0);
+            if (got != (ssize_t)st.st_size) {
+                cmdarg_err("Worker %u can't read its ordinals: %s", shard,
+                        g_strerror(errno));
+                exit(WS_EXIT_INIT_FAILED);
+            }
+            ordinal_set_provider(jobs_ordinal_replay, NULL);
+        }
+
+        jobs_index_fp = fdopen(worker->idx_fd, "wb");
+        if (jobs_index_fp == NULL ||
+                dup2(worker->out_fd, STDOUT_FILENO) < 0) {
+            cmdarg_err("Worker %u can't use its spool: %s", shard,
+                    g_strerror(errno));
+            exit(WS_EXIT_INIT_FAILED);
+        }
+    }
+
+    if (spill_dir != NULL) {
+        char *spill_err;
+
+        /* A store is a set of mappings that one process hands out
+         * addresses from, so each worker needs its own. The watermark is
+         * what the run as a whole may keep in RAM, so it is divided
+         * between them; the reserve is address space, which costs
+         * nothing until it is used. */
+        capture_backing = wmem_backing_file_new(spill_dir, spill_reserve,
+                spill_after / count, &spill_err);
+        if (capture_backing == NULL) {
+            cmdarg_err("Worker %u can't spill to \"%s\": %s", shard,
+                    spill_dir, spill_err);
+            exit(WS_EXIT_INVALID_OPTION);
+        }
+        wmem_set_capture_backing(capture_backing);
+    }
+}
+
+/*
+ * Fork one pass of workers. Returns true in a worker, which then reads
+ * the capture file as usual; in the parent it waits for them all and
+ * returns false, with the first unsuccessful exit status, if any, in
+ * *worker_status.
+ */
+static bool
+jobs_run_pass(jobs_worker_t *workers, unsigned count, unsigned pass,
+        int *worker_status, bool *failed)
+{
+    unsigned i;
+
+    /* Fork after epan_init(), so the dissector tables are set up once and
+     * shared copy-on-write, and so that each worker inherits a complete,
+     * identical plan. */
+    for (i = 0; i < count; i++) {
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            cmdarg_err("Can't start worker %u: %s", i, g_strerror(errno));
+            *failed = true;
+            return false;
+        }
+        if (pid == 0) {
+            jobs_worker_start(&workers[i], i, count, pass);
+            return true;
+        }
+        workers[i].pid = pid;
+    }
+
+    /* A worker that stopped on a bad file has still printed the packets
+     * it got through, exactly as a single process would have, so its
+     * status is passed on rather than replaced and its output is still
+     * written out. */
+    for (i = 0; i < count; i++) {
+        int status = 0;
+
+        if (waitpid(workers[i].pid, &status, 0) < 0) {
+            cmdarg_err("Can't wait for worker %u: %s", i, g_strerror(errno));
+            *failed = true;
+        }
+        else if (WIFSIGNALED(status)) {
+            cmdarg_err("Worker %u was killed by signal %d", i,
+                    WTERMSIG(status));
+            *failed = true;
+        }
+        else if (WEXITSTATUS(status) != EXIT_SUCCESS) {
+            *worker_status = WEXITSTATUS(status);
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Run the capture file across several processes, each dissecting whole
+ * flows. Returns true in a worker, which then reads the file as usual;
+ * returns false in the parent once the workers are done and their output
+ * has been written out, with the exit status in *exit_status.
+ */
+static bool
+jobs_fork(const char *filename, unsigned count, bool need_ordinals,
+        int *exit_status)
 {
     jobs_worker_t *workers;
     int            err = 0;
     char          *err_info = NULL;
     unsigned       i;
     bool           failed = false;
-    int            status_from_worker;
+    int            status_from_worker = EXIT_SUCCESS;
 
     jobs_plan = flow_shard_plan_new(filename, count, &err, &err_info);
     if (jobs_plan == NULL) {
@@ -599,9 +1027,12 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
     workers = g_new0(jobs_worker_t, count);
 
     for (i = 0; i < count; i++) {
-        workers[i].out_fd = jobs_spool_open();
-        workers[i].idx_fd = jobs_spool_open();
-        if (workers[i].out_fd < 0 || workers[i].idx_fd < 0) {
+        workers[i].out_fd   = jobs_spool_open();
+        workers[i].idx_fd   = jobs_spool_open();
+        workers[i].ord_fd   = jobs_spool_open();
+        workers[i].names_fd = jobs_spool_open();
+        if (workers[i].out_fd < 0 || workers[i].idx_fd < 0 ||
+                workers[i].ord_fd < 0 || workers[i].names_fd < 0) {
             cmdarg_err("Can't create a spool file for worker %u: %s", i,
                     g_strerror(errno));
             *exit_status = WS_EXIT_INVALID_FILE;
@@ -609,70 +1040,26 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
         }
     }
 
-    /* Fork after epan_init(), so the dissector tables are set up once and
-     * shared copy-on-write, and so that each worker inherits a complete,
-     * identical plan. */
-    for (i = 0; i < count; i++) {
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            cmdarg_err("Can't start worker %u: %s", i, g_strerror(errno));
-            *exit_status = WS_EXIT_INIT_FAILED;
-            goto fail;
-        }
-        if (pid == 0) {
-            jobs_shard     = i;
-            jobs_index_fp  = fdopen(workers[i].idx_fd, "wb");
-            if (jobs_index_fp == NULL ||
-                    dup2(workers[i].out_fd, STDOUT_FILENO) < 0) {
-                cmdarg_err("Worker %u can't use its spool: %s", i,
-                        g_strerror(errno));
-                exit(WS_EXIT_INIT_FAILED);
-            }
-            if (spill_dir != NULL) {
-                char *spill_err;
-
-                /* A store is a set of mappings that one process hands
-                 * out addresses from, so each worker needs its own. The
-                 * watermark is what the run as a whole may keep in RAM,
-                 * so it is divided between them; the reserve is address
-                 * space, which costs nothing until it is used. */
-                capture_backing = wmem_backing_file_new(spill_dir,
-                        spill_reserve, spill_after / count, &spill_err);
-                if (capture_backing == NULL) {
-                    cmdarg_err("Worker %u can't spill to \"%s\": %s", i,
-                            spill_dir, spill_err);
-                    exit(WS_EXIT_INVALID_OPTION);
-                }
-                wmem_set_capture_backing(capture_backing);
-            }
-
+    /* Output that carries an ordinal - packet details, or any of the
+     * structured formats - needs a pass to find out what the capture as
+     * a whole would have numbered them. Summary columns do not carry
+     * any, so that pass is skipped. */
+    if (need_ordinals) {
+        if (jobs_run_pass(workers, count, 1, &status_from_worker, &failed)) {
             g_free(workers);
             return true;
         }
-        workers[i].pid = pid;
+        if (!failed && !jobs_merge_ordinals(workers, count)) {
+            cmdarg_err("Can't work out the conversation numbering: %s",
+                    g_strerror(errno));
+            failed = true;
+        }
     }
 
-    /* A worker that stopped on a bad file has still printed the packets
-     * it got through, exactly as a single process would have, so its
-     * status is passed on rather than replaced and its output is still
-     * written out. */
-    status_from_worker = EXIT_SUCCESS;
-    for (i = 0; i < count; i++) {
-        int status = 0;
-
-        if (waitpid(workers[i].pid, &status, 0) < 0) {
-            cmdarg_err("Can't wait for worker %u: %s", i, g_strerror(errno));
-            failed = true;
-        }
-        else if (WIFSIGNALED(status)) {
-            cmdarg_err("Worker %u was killed by signal %d", i,
-                    WTERMSIG(status));
-            failed = true;
-        }
-        else if (WEXITSTATUS(status) != EXIT_SUCCESS) {
-            status_from_worker = WEXITSTATUS(status);
-        }
+    if (!failed &&
+            jobs_run_pass(workers, count, 2, &status_from_worker, &failed)) {
+        g_free(workers);
+        return true;
     }
 
     if (!failed) {
@@ -701,6 +1088,12 @@ fail:
         }
         if (workers[i].out_fd > 0) {
             ws_close(workers[i].out_fd);
+        }
+        if (workers[i].ord_fd > 0) {
+            ws_close(workers[i].ord_fd);
+        }
+        if (workers[i].names_fd > 0) {
+            ws_close(workers[i].names_fd);
         }
     }
     g_free(workers);
@@ -3128,16 +3521,11 @@ main(int argc, char *argv[])
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
-        if (output_action != WRITE_TEXT || print_details) {
-            /* Conversation index fields - tcp.stream and the rest - are
-             * numbered in the order the conversations are created, which
-             * in a worker is the order of its own flows and not of the
-             * capture's. Summary columns do not carry them; packet
-             * details and the structured formats do, so they would come
-             * out differently from a single-process run. */
-            cmdarg_err("--jobs only supports summary output; packet details "
-                    "and -T formats other than text number conversations "
-                    "per worker");
+        if (output_action == WRITE_JSON || output_action == WRITE_JSON_RAW) {
+            /* The JSON writer puts the separators between elements in as
+             * it goes, so each worker's spool starts a fresh array and
+             * the pieces cannot simply be concatenated. */
+            cmdarg_err("--jobs cannot be used with -T json or -T jsonraw");
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
@@ -3166,7 +3554,13 @@ main(int argc, char *argv[])
                 "traffic set up by signalling on another flow (RTP from "
                 "SDP, for example) may be dissected differently");
 
-        if (!jobs_fork(cf_name, jobs, (int *)&exit_status)) {
+        /* Output that shows a conversation index - packet details, or
+         * any of the structured formats - needs the extra pass that
+         * works out what the capture as a whole would have numbered
+         * them. Summary columns never show one. */
+        if (!jobs_fork(cf_name, jobs,
+                    print_details || output_action != WRITE_TEXT,
+                    (int *)&exit_status)) {
             goto clean_exit;
         }
         /* A worker: carry on and read the file, printing the packets this
@@ -3200,7 +3594,11 @@ main(int argc, char *argv[])
         /* Do we need to do dissection of packets?  That depends on, among
            other things, what taps are listening, so determine that after
            starting the statistics taps. */
-        do_dissection = must_do_dissection(rfcode, dfcode, pdu_export_arg);
+        /* The first pass of a sharded run prints nothing; it is there to
+         * find out which conversation indices the capture creates, which
+         * only happens if it dissects. */
+        do_dissection = must_do_dissection(rfcode, dfcode, pdu_export_arg) ||
+            jobs_pass == 1;
         ws_debug("tshark: do_dissection = %s", do_dissection ? "TRUE" : "FALSE");
 
         /* Process the packets in the file */
@@ -4759,7 +5157,7 @@ process_cap_file_single_pass(capture_file *cf, wtap_dumper *pdh,
         }
 
 #ifndef _WIN32
-        if (jobs_plan != NULL) {
+        if (jobs_plan != NULL && jobs_pass == 2) {
             jobs_record_packet((uint32_t)framenum, packet_start);
         }
 #endif

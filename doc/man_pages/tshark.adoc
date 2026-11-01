@@ -2539,13 +2539,27 @@ The speedup is bounded by the largest flow: a capture where one
 conversation is a third of the packets cannot go more than three times
 faster, whatever __count__ is. Run *--shard-plan* first to see.
 
-This option works on a capture file only, and only for summary output.
-It is refused with *-w*, *--export-pdu*, *-q*, *-2*, *-z*, *-V*, *-T*
-formats other than text, and read or display filters, because the result
-would not be the result of a single-process run: conversation index fields
-such as __tcp.stream__ are numbered per worker, statistics would cover one
-worker's flows, and a worker cannot tell whether a packet it did not
+Fields that number things in the order they are first seen -- __tcp.stream__,
+__udp.stream__, __ip.stream__, __eth.stream__ and the rest -- would
+otherwise be numbered per worker. When the output can show one, which is
+any output other than summary columns, *TShark* makes an extra pass that
+dissects without printing, works out the numbering the capture as a whole
+would have produced, and hands it to the workers for the pass that
+prints. That doubles the dissection work, so summary output, which never
+shows such a field, skips it.
+
+This option works on a capture file only. It is refused with *-w*,
+*--export-pdu*, *-q*, *-2*, *-z*, *-T json*, *-T jsonraw*, and read or
+display filters, because the result would not be the result of a
+single-process run: statistics would cover one worker's flows, the JSON
+writer puts separators between elements as it goes so the pieces cannot
+be concatenated, and a worker cannot tell whether a packet it did not
 dissect would have passed a filter.
+
+Dissection state that is not keyed on the addresses in the outer headers
+can still differ: traffic set up by signalling carried on another flow
+(RTP announced in SDP), and tunnelled traffic whose inner flow spans
+several outer address pairs.
 
 With *--spill-dir*, each worker gets a store of its own, since a mapping
 that two processes allocate from independently is not a store they can

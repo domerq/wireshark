@@ -75,7 +75,37 @@ for packets it never dissects (jobs_skip_packet() in tshark.c). Without
 that, every time column would be measured from each worker's own first
 packet.
 
-5. What it refuses
+5. Numbering things in the order they are first seen
+----------------------------------------------------
+
+tcp.stream, udp.stream, ip.stream, eth.stream, conversation indices: all
+of these are counters incremented as the dissection meets something new,
+and a worker that only sees its own flows would start each of them at
+zero. epan/ordinal.[ch] turns them from a static into a counter that can
+be answered by a provider; with no provider installed, which is every
+ordinary run, ordinal_next() is exactly the static it replaced.
+
+When the output can show such a field - anything other than summary
+columns - the workers run twice. The first pass dissects without
+printing and records, in creation order, the frame each value was handed
+out for. The parent merges those records by frame number, which is the
+order one process would have created them in, and gives each worker back
+the values it should hand out. The second pass prints.
+
+Two things make that exact rather than approximate. A value can be asked
+for with an identity - the pair of addresses, or addresses and ports -
+for things that more than one worker can meet: the inner header of an
+ICMP error names a flow that belongs to someone else, and a pair of MAC
+addresses carries many flows. Everything numbering the same identity
+gets the same value. And the second pass checks the frame of every value
+it is handed against the frame the first pass recorded, so a dissection
+that took a different path is a loud failure rather than quietly
+different output.
+
+The cost is that dissection happens twice, so this is skipped for
+summary output.
+
+6. What it refuses
 ------------------
 
 Only cases where the output would match a single-process run are
@@ -83,10 +113,9 @@ accepted. The rest are refused rather than approximated:
 
     -z                  tap accumulators would cover one worker's flows.
                         Folding them back together is per-tap work.
-    -V, -T pdml/json/ek Conversation index fields - tcp.stream and the
-                        rest - are numbered in conversation creation
-                        order, which in a worker is the order of its own
-                        flows. Summary columns do not carry them.
+    -T json, jsonraw    the JSON writer puts the separators between
+                        elements in as it goes, so each worker's spool
+                        starts a fresh array.
     -Y, -R              A worker cannot know whether a packet it never
                         dissected would have passed a filter, so columns
                         measured from the previous displayed packet would
@@ -96,23 +125,28 @@ accepted. The rest are refused rather than approximated:
     -2                  Not implemented.
     Windows             No fork().
 
-6. What it cannot refuse
+7. What it cannot refuse
 ------------------------
 
-Traffic set up by signalling carried on a different flow is dissected as
-whatever it looks like on its own when the signalling went to another
-worker. RTP announced in SDP is the usual case: of the 254 captures in
-test/captures, 253 are byte-identical at 3 workers and sip-rtp.pcapng is
-not, because the media and the signalling are different address pairs and
-the media worker never saw the SDP.
+Dissection state keyed on something other than the addresses in the
+outer headers can still differ. Of the 254 captures in test/captures,
+252 are byte-identical under -V -x at 3 workers, and the two that are
+not show the two shapes of this:
 
-The same shape of hazard exists for ICMP errors referring to another
-flow, TLS session resumption through the global key map, and names
-learned from DNS. Nothing in a plan built before dissection can know
-about those relationships, so --jobs says on stderr that it dissects
-flows independently rather than quietly differing.
+  - sip-rtp.pcapng: RTP is announced by SDP carried on a different
+    address pair, so the worker that owns the media never saw the
+    announcement and dissects it as UDP.
+  - uet-generated-crc-encaps.pcap: a tunnel, where one inner flow spans
+    several outer address pairs, so its per-conversation packet count
+    and timings are split between workers.
 
-7. Cost
+The same shape of hazard exists for TLS session resumption through the
+global key map and for names learned from DNS. Nothing in a plan built
+before dissection can know about those relationships, so --jobs says on
+stderr that it dissects flows independently rather than quietly
+differing.
+
+8. Cost
 -------
 
 A real 526 MB capture, 749 804 packets, 669 address pairs, summary output:
@@ -134,14 +168,8 @@ to an unspilled run in both cases. Sharding and spilling help each other:
 each worker holds a fraction of the state (176, 200, 419 and 924 MB here,
 against 1528 MB in one process), and a smaller arena is a warmer one.
 
-8. Limits and next steps
+9. Limits and next steps
 ------------------------
-
-Global conversation numbering. This is what blocks -V and the structured
-output formats, which is most of what TShark is used for. A worker would
-have to know the rank of a conversation among all of the capture's
-conversations, which means the index pass would have to enumerate
-conversations the way the dissectors key them, not just address pairs.
 
 Mergeable taps. -z could be supported for the accumulators that fold -
 conversations, endpoints - with a capability flag on the tap, and
@@ -150,16 +178,21 @@ frame-number tie-breaks).
 
 Filters, two-pass, and JSON. A display filter needs the previous
 displayed frame, which needs either an extra pass or a different
-definition of the delta columns. JSON needs the workers to emit elements
-that can be concatenated.
+definition of the delta columns. JSON needs the workers to emit
+elements that can be concatenated.
 
-Affinity. The v2 answer to section 6 is to let a worker that discovers a
-relationship - SDP announcing a media address - hand that flow to the
-worker that owns the signalling, which means the plan has to be
-adjustable while the run is in progress.
+The second pass. Output that shows an ordinal costs two dissections.
+The first one could be cheaper - it needs the conversations, not the
+fields - but nothing in epan distinguishes those today.
 
-9. Reproducing the measurements
--------------------------------
+Affinity. The answer to section 7 is to let a worker that discovers a
+relationship - SDP announcing a media address, a tunnel carrying a flow
+that belongs elsewhere - hand that flow to the worker that owns the
+other end, which means the plan has to be adjustable while the run is
+in progress.
+
+10. Reproducing the measurements
+--------------------------------
 
 test/benchmark/gen_pcap.py generates captures with an exact packet and
 flow count; test/benchmark/flow_split.py splits a real capture into
