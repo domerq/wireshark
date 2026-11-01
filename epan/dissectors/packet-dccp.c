@@ -46,6 +46,7 @@
 #include "config.h"
 
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/addr_resolv.h>
 #include <epan/in_cksum.h>
 #include <epan/prefs.h>
@@ -312,7 +313,10 @@ static bool dccp_summary_in_tree = true;
 static bool try_heuristic_first;
 static bool dccp_check_checksum  = true;
 static bool dccp_relative_seq    = true;
-static uint32_t dccp_stream_count;
+
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t dccp_stream_ordinal = ORDINAL_COUNTER_INIT("dccp.stream");
 
 static void
 decode_dccp_ports(tvbuff_t *tvb, int offset, packet_info *pinfo,
@@ -402,7 +406,7 @@ init_dccp_conversation_data(packet_info *pinfo)
   dccpd->flow2.static_flags = 0;
   dccpd->flow2.base_seq     = 0;
 
-  dccpd->stream   = dccp_stream_count++;
+  dccpd->stream   = ordinal_next(&dccp_stream_ordinal, pinfo->num);
   dccpd->ts_first = pinfo->abs_ts;
   dccpd->ts_prev  = pinfo->abs_ts;
 
@@ -560,7 +564,7 @@ dccpip_endpoint_packet(void *pit, packet_info *pinfo, epan_dissect_t *edt _U_, c
 /* Return the current stream count */
 static uint32_t get_dccp_stream_count(void)
 {
-    return dccp_stream_count;
+    return dccp_stream_ordinal.next;
 }
 
 static bool
@@ -1638,7 +1642,7 @@ dissect_dccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
 static void
 dccp_init(void)
 {
-  dccp_stream_count = 0;
+  ordinal_counter_reset(&dccp_stream_ordinal);
 }
 
 void

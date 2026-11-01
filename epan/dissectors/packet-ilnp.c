@@ -24,6 +24,7 @@
 
 #include "config.h"
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/address_types.h>
 #include <epan/to_str.h>
 #include <epan/proto.h>
@@ -69,8 +70,9 @@ static int ett_ilnp;
 
 static dissector_handle_t ilnp_handle;
 
-// Global ILNP Stream counter
-static uint32_t ilnp_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t ilnp_stream_ordinal = ORDINAL_COUNTER_INIT("ilnp.stream");
 
 /* ILNP tap handle */
 static int ilnp_tap;
@@ -173,7 +175,7 @@ init_ilnp_conversation_data(packet_info *pinfo) {
     ilnpd=wmem_new0(wmem_file_scope(), struct ilnp_analysis);
 
     ilnpd->initial_frame = pinfo->num;
-    ilnpd->stream = ilnp_stream_count++;
+    ilnpd->stream = ordinal_next(&ilnp_stream_ordinal, pinfo->num);
 
     return ilnpd;
 }
@@ -453,7 +455,7 @@ dissect_ilnp(tvbuff_t* tvb, packet_info* pinfo, proto_tree* tree, void* data _U_
 
 // Initialise the ILNP dissector with a stream count starting at 0
 static void ilnp_init(void) {
-    ilnp_stream_count = 0;
+    ordinal_counter_reset(&ilnp_stream_ordinal);
 }
 
 void proto_register_ilnp(void) {

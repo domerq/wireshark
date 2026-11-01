@@ -50,6 +50,7 @@
 #include "config.h"
 
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/reassemble.h>
 #include <epan/asn1.h>
 #include <epan/tap.h>
@@ -270,7 +271,9 @@ static heur_dissector_list_t ssl_heur_subdissector_list;
 
 static const char *ssl_debug_file_name;
 
-static uint32_t tls_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t tls_stream_ordinal = ORDINAL_COUNTER_INIT("tls.stream");
 
 /* Forward declaration we need below */
 void proto_reg_handoff_ssl(void);
@@ -281,7 +284,8 @@ static reassembly_table ssl_reassembly_table;
 
 /* Table to hold fragmented TLS handshake records. */
 static reassembly_table tls_hs_reassembly_table;
-static uint32_t hs_reassembly_id_count;
+static ordinal_counter_t hs_reassembly_ordinal =
+    ORDINAL_COUNTER_INIT("tls.handshake.reassembly_id");
 
 /* Fragment TLS handshake reassembly functions. The records are
  * organized by session and direction; this allows reassembly across
@@ -342,12 +346,12 @@ tls_hs_reassembly_table_functions = {
 
 static uint32_t get_tls_stream_count(void)
 {
-    return tls_stream_count;
+    return tls_stream_ordinal.next;
 }
 
-uint32_t tls_increment_stream_count(void)
+uint32_t tls_increment_stream_count(uint32_t frame)
 {
-    return tls_stream_count++;
+    return ordinal_next(&tls_stream_ordinal, frame);
 }
 
 /* initialize/reset per capture state data (ssl sessions cache) */
@@ -359,9 +363,9 @@ ssl_init(void)
     ssl_debug_flush();
 
     /* Reset the identifier for a group of handshake fragments. */
-    hs_reassembly_id_count = 0;
+    ordinal_counter_reset(&hs_reassembly_ordinal);
 
-    tls_stream_count = 0;
+    ordinal_counter_reset(&tls_stream_ordinal);
 }
 
 static void
@@ -904,7 +908,7 @@ dissect_ssl(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
      */
     conversation = find_or_create_conversation_strat(pinfo);
 
-    ssl_session_save = ssl_session = ssl_get_session(conversation, tls_handle, curr_layer_num_ssl);
+    ssl_session_save = ssl_session = ssl_get_session(conversation, tls_handle, curr_layer_num_ssl, pinfo->num);
     session = &ssl_session->session;
     is_from_server = ssl_packet_from_server(session, ssl_associations, pinfo);
 
@@ -1238,7 +1242,7 @@ dissect_tls13_handshake(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, voi
     ssl_debug_printf("\n%s enter frame #%u (%s)\n", G_STRFUNC, pinfo->num, (pinfo->fd->visited)?"already visited":"first time");
 
     conversation = find_or_create_conversation(pinfo);
-    ssl_session = ssl_get_session(conversation, tls13_handshake_handle, curr_layer_num_ssl);
+    ssl_session = ssl_get_session(conversation, tls13_handshake_handle, curr_layer_num_ssl, pinfo->num);
     session = &ssl_session->session;
     is_from_server = ssl_packet_from_server(session, ssl_associations, pinfo);
     if (session->version == SSL_VER_UNKNOWN) {
@@ -3069,7 +3073,8 @@ dissect_tls_handshake(tvbuff_t *tvb, packet_info *pinfo,
             // Need more data to find the message length or complete it.
             if (!PINFO_FD_VISITED(pinfo)) {
                 uint8_t msg_type = tvb_get_uint8(tvb, offset);
-                *hs_reassembly_id_p = ++hs_reassembly_id_count;
+                /* Zero means "no reassembly in progress", so count from one. */
+                *hs_reassembly_id_p = ordinal_next(&hs_reassembly_ordinal, pinfo->num) + 1;
                 frag_info = save_tls_handshake_fragment(pinfo, curr_layer_num_tls, record_id, *hs_reassembly_id_p,
                         tvb, offset, subset_len, 0, msg_type, false, session);
             } else {
@@ -4113,7 +4118,7 @@ void ssl_set_master_secret(uint32_t frame_num, address *addr_srv, address *addr_
     /* XXX - This need to be updated to handle tunneling. This API call was
      * only ever used by external dissectors and plugins. For now just support
      * the outer TLS layer. */
-    ssl = ssl_get_session(conversation, tls_handle, 0);
+    ssl = ssl_get_session(conversation, tls_handle, 0, frame_num);
 
     ssl_debug_printf("  conversation = %p, ssl_session = %p\n", (void *)conversation, (void *)ssl);
 
