@@ -445,6 +445,22 @@ char *format_size_wmem(wmem_allocator_t *allocator, int64_t size,
 #define format_size(size, unit, flags) \
     format_size_wmem(NULL, size, unit, flags)
 
+/** Read a size written the way a person writes one
+ *
+ * A plain number, in units of @p default_unit, or a number with a K, M,
+ * G or T on the end - optionally followed by a B - counted in powers of
+ * 1024. So with a default unit of a megabyte, "2048", "2G" and "2GB" are
+ * all the same size.
+ *
+ * @param str The string to read.
+ * @param default_unit What a bare number counts in, in bytes.
+ * @param size Set to the size in bytes.
+ * @return false if the string is not a size, or overflows, in which case
+ *         *size is untouched.
+ */
+WS_DLL_PUBLIC
+bool ws_parse_size(const char *str, uint64_t default_unit, uint64_t *size);
+
 /**
  * @brief Return a printable character or '.' if non-printable.
  *

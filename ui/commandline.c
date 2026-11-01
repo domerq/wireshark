@@ -208,9 +208,11 @@ commandline_print_usage(commandline_usage_app_data_t* app_data, bool for_help_op
     fprintf(output, "  --spill-dir <directory>  keep capture-lifetime dissection state in a temporary file\n");
     fprintf(output, "                           in this directory instead of in RAM, so that captures\n");
     fprintf(output, "                           whose state exceeds memory can still be analyzed\n");
-    fprintf(output, "  --spill-after <size>     dissection state to keep in RAM before spilling, in MB\n");
+    fprintf(output, "  --spill-after <size>     dissection state to keep in RAM before spilling; a plain\n");
+    fprintf(output, "                           number is MB, or use K/M/G/T\n");
     fprintf(output, "                           (def: %" PRIu64 "MB; 0 spills everything)\n", commandline_info.spill_after / (1024 * 1024));
     fprintf(output, "  --spill-reserve <size>   address space to map for --spill-dir at a time, in MB\n");
+    fprintf(output, "                           or K/M/G/T\n");
     fprintf(output, "                           (def: %" PRIu64 "MB)\n", commandline_info.spill_reserve / (1024 * 1024));
     fprintf(output, "\n");
 
@@ -429,30 +431,21 @@ int commandline_early_options(int argc, char *argv[], commandline_usage_app_data
                 commandline_info.spill_dir = ws_optarg;
                 break;
             case LONGOPT_SPILL_RESERVE:
-            {
-                uint64_t spill_reserve_mb;
-
-                if (!ws_strtou64(ws_optarg, NULL, &spill_reserve_mb) ||
-                        spill_reserve_mb == 0) {
-                    cmdarg_err("\"%s\" isn't a valid reserve size in MB",
-                            ws_optarg);
+                if (!ws_parse_size(ws_optarg, 1024 * 1024,
+                            &commandline_info.spill_reserve) ||
+                        commandline_info.spill_reserve == 0) {
+                    cmdarg_err("\"%s\" isn't a valid reserve size", ws_optarg);
                     return WS_EXIT_INVALID_OPTION;
                 }
-                commandline_info.spill_reserve = spill_reserve_mb * 1024 * 1024;
                 break;
-            }
             case LONGOPT_SPILL_AFTER:
-            {
-                uint64_t spill_after_mb;
-
-                if (!ws_strtou64(ws_optarg, NULL, &spill_after_mb)) {
-                    cmdarg_err("\"%s\" isn't a valid amount of memory in MB",
+                if (!ws_parse_size(ws_optarg, 1024 * 1024,
+                            &commandline_info.spill_after)) {
+                    cmdarg_err("\"%s\" isn't a valid amount of memory",
                             ws_optarg);
                     return WS_EXIT_INVALID_OPTION;
                 }
-                commandline_info.spill_after = spill_after_mb * 1024 * 1024;
                 break;
-            }
             case '?':        /* Ignore errors - the "real" scan will catch them. */
                 break;
         }
