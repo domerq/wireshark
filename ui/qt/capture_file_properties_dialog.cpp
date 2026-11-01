@@ -18,6 +18,8 @@
 #include "wiretap/secrets-types.h"
 
 #include "wsutil/str_util.h"
+#include "wsutil/wmem/wmem_backing.h"
+#include "epan/wmem_scopes.h"
 #include "wsutil/utf8_entities.h"
 #include "app/application_flavor.h"
 
@@ -648,6 +650,36 @@ QString CaptureFilePropertiesDialog::summaryToHtml()
         << table_row_end;
 
     out << table_end;
+
+    // Dissection state, when it is being kept in a file rather than in
+    // memory. These are the figures --spill-after wants to be tuned
+    // against, and there is nowhere else to see them.
+    if (wmem_capture_backing() != NULL) {
+        wmem_backing_t *backing = wmem_capture_backing();
+
+        out << section_tmpl_.arg(tr("Dissection state"));
+        out << table_begin;
+
+        out << table_row_begin
+            << table_vheader_tmpl.arg(tr("Peak in memory"))
+            << table_data_tmpl.arg(tr("%1 MB").arg(
+                        wmem_backing_bytes_in_ram(backing) / (1024 * 1024)))
+            << table_row_end;
+
+        out << table_row_begin
+            << table_vheader_tmpl.arg(tr("Peak spilled to disk"))
+            << table_data_tmpl.arg(tr("%1 MB").arg(
+                        wmem_backing_bytes_high_water(backing) /
+                        (1024 * 1024)))
+            << table_row_end;
+
+        out << table_row_begin
+            << table_vheader_tmpl.arg(tr("Spill file"))
+            << table_data_tmpl.arg(wmem_backing_path(backing))
+            << table_row_end;
+
+        out << table_end;
+    }
 
     return summary_str;
 }
