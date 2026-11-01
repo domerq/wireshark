@@ -14,6 +14,7 @@
 #include "packet-udp.h"
 
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/capture_dissectors.h>
 #include <epan/addr_resolv.h>
 #include <epan/in_cksum.h>
@@ -108,7 +109,9 @@ static bool udplite_check_checksum;
 
 static dissector_table_t udp_dissector_table;
 static heur_dissector_list_t heur_subdissector_list;
-static uint32_t udp_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t udp_stream_ordinal = ORDINAL_COUNTER_INIT("udp.stream");
 
 /* Determine if there is a sub-dissector and call it.  This has been */
 /* separated into a stand alone routine so other protocol dissectors */
@@ -182,7 +185,7 @@ init_udp_conversation_data(packet_info *pinfo)
     udpd->flow2.command = NULL;
     */
 
-    udpd->stream = udp_stream_count++;
+    udpd->stream = ordinal_next(&udp_stream_ordinal, pinfo->num);
     udpd->ts_first = pinfo->abs_ts;
     udpd->ts_prev = pinfo->abs_ts;
 
@@ -449,7 +452,7 @@ add_udp_process_info(uint32_t frame_num, address *local_addr, address *remote_ad
 /* Return the current stream count */
 uint32_t get_udp_stream_count(void)
 {
-    return udp_stream_count;
+    return udp_stream_ordinal.next;
 }
 
 static void
@@ -1348,7 +1351,7 @@ dissect_udplite(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data 
 static void
 udp_init(void)
 {
-    udp_stream_count = 0;
+    ordinal_counter_reset(&udp_stream_ordinal);
 }
 
 void

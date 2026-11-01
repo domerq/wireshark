@@ -16,6 +16,7 @@
 #include "config.h"
 
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/capture_dissectors.h>
 #include <epan/addr_resolv.h>
 #include <epan/maxmind_db.h>
@@ -293,7 +294,9 @@ static dissector_table_t ip_option_table;
 
 static int ett_geoip_info;
 
-static uint32_t ip_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t ip_stream_ordinal = ORDINAL_COUNTER_INIT("ip.stream");
 
 static const fragment_items ip_frag_items = {
   &ett_ip_fragment,
@@ -1929,7 +1932,7 @@ init_ip_conversation_data(packet_info *pinfo)
 
     ipd->initial_frame = pinfo->num;
     ipd->stream = 0;
-    ipd->stream = ip_stream_count++;
+    ipd->stream = ordinal_next(&ip_stream_ordinal, pinfo->num);
 
     return ipd;
 }
@@ -2616,7 +2619,7 @@ dissect_ip_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 static void
 ip_init(void)
 {
-    ip_stream_count = 0;
+    ordinal_counter_reset(&ip_stream_ordinal);
 }
 
 void

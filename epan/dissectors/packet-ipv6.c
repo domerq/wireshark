@@ -18,6 +18,7 @@
 
 #include <math.h>
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/capture_dissectors.h>
 #include <epan/expert.h>
 #include <epan/ip_opts.h>
@@ -546,7 +547,9 @@ static int ett_ipv6_dstopts_proto;
 
 static int ett_geoip_info;
 
-static uint32_t ipv6_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t ipv6_stream_ordinal = ORDINAL_COUNTER_INIT("ipv6.stream");
 
 static expert_field ei_ipv6_routing_invalid_length;
 static expert_field ei_ipv6_routing_invalid_segleft;
@@ -3773,7 +3776,7 @@ init_ipv6_conversation_data(packet_info *pinfo)
 
     ipv6d->initial_frame = pinfo->num;
     ipv6d->stream = 0;
-    ipv6d->stream = ipv6_stream_count++;
+    ipv6d->stream = ordinal_next(&ipv6_stream_ordinal, pinfo->num);
 
     return ipv6d;
 }
@@ -4164,7 +4167,7 @@ ipv6_dissect_next(unsigned nxt, tvbuff_t *tvb, packet_info *pinfo, proto_tree *t
 static void
 ipv6_init(void)
 {
-    ipv6_stream_count = 0;
+    ordinal_counter_reset(&ipv6_stream_ordinal);
 }
 
 void
