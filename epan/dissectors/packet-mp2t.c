@@ -27,6 +27,7 @@
 #include <epan/exceptions.h>
 #include <epan/show_exception.h>
 #include <epan/addr_resolv.h>
+#include <epan/ordinal.h>
 #include "packet-l2tp.h"
 #include "packet-udp.h"
 #include "packet-mp2t.h"
@@ -293,7 +294,9 @@ static const fragment_items mp2t_msg_frag_items = {
 
 static wmem_map_t *mp2t_stream_hashtable;
 
-static uint32_t mp2t_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t mp2t_stream_ordinal = ORDINAL_COUNTER_INIT("mp2t.stream");
 
 typedef struct {
     const conversation_t* conv;
@@ -400,13 +403,13 @@ typedef struct frame_analysis_data {
 } frame_analysis_data_t;
 
 static mp2t_analysis_data_t *
-init_mp2t_conversation_data(void)
+init_mp2t_conversation_data(uint32_t frame)
 {
     mp2t_analysis_data_t *mp2t_data;
 
     mp2t_data = wmem_new0(wmem_file_scope(), struct mp2t_analysis_data);
 
-    mp2t_data->stream = mp2t_stream_count++;
+    mp2t_data->stream = ordinal_next(&mp2t_stream_ordinal, frame);
     mp2t_data->pid_table = wmem_tree_new(wmem_file_scope());
 
     mp2t_data->frame_table = wmem_tree_new(wmem_file_scope());
@@ -418,7 +421,7 @@ init_mp2t_conversation_data(void)
 }
 
 static mp2t_analysis_data_t *
-get_mp2t_conversation_data(mp2t_stream_key *key)
+get_mp2t_conversation_data(mp2t_stream_key *key, uint32_t frame)
 {
     mp2t_stream_key      *new_key;
     mp2t_analysis_data_t *mp2t_data;
@@ -427,7 +430,7 @@ get_mp2t_conversation_data(mp2t_stream_key *key)
     if (!mp2t_data) {
         new_key = wmem_new(wmem_file_scope(), mp2t_stream_key);
         *new_key = *key;
-        mp2t_data = init_mp2t_conversation_data();
+        mp2t_data = init_mp2t_conversation_data(frame);
         wmem_map_insert(mp2t_stream_hashtable, new_key, mp2t_data);
     }
 
@@ -479,13 +482,13 @@ get_pid_analysis(mp2t_analysis_data_t *mp2t_data, uint32_t pid)
 uint32_t
 mp2t_get_stream_count(void)
 {
-    return mp2t_stream_count;
+    return mp2t_stream_ordinal.next;
 }
 
 static void
 mp2t_init(void)
 {
-    mp2t_stream_count = 0;
+    ordinal_counter_reset(&mp2t_stream_ordinal);
 }
 
 static gboolean
@@ -528,7 +531,7 @@ char *mp2t_follow_conv_filter(epan_dissect_t *edt _U_, packet_info *pinfo, unsig
 
     stream_key = (mp2t_stream_key *)p_get_proto_data(pinfo->pool, pinfo, proto_mp2t, MP2T_PROTO_DATA_STREAM);
     if (stream_key) {
-        mp2t_analysis_data_t *mp2t_data = get_mp2t_conversation_data(stream_key);
+        mp2t_analysis_data_t *mp2t_data = get_mp2t_conversation_data(stream_key, pinfo->num);
         pid = GPOINTER_TO_UINT(p_get_proto_data(pinfo->pool, pinfo, proto_mp2t, MP2T_PROTO_DATA_PID));
         *stream = mp2t_data->stream;
         *sub_stream = pid;
@@ -629,7 +632,7 @@ mp2t_add_stream_type(packet_info *pinfo, uint32_t pid, uint32_t stream_type)
         return;
     }
 
-    mp2t_analysis_data_t *mp2t_data = get_mp2t_conversation_data(stream);
+    mp2t_analysis_data_t *mp2t_data = get_mp2t_conversation_data(stream, pinfo->num);
     pid_analysis_data_t *pid_data = get_pid_analysis(mp2t_data, pid);
 
     if (!pid_data->stream_types) {
@@ -651,7 +654,7 @@ mp2t_add_registration_id(packet_info *pinfo, uint32_t pid, uint32_t registration
         return;
     }
 
-    mp2t_analysis_data_t *mp2t_data = get_mp2t_conversation_data(stream);
+    mp2t_analysis_data_t *mp2t_data = get_mp2t_conversation_data(stream, pinfo->num);
     pid_analysis_data_t *pid_data = get_pid_analysis(mp2t_data, pid);
 
     stored_id = wmem_new(wmem_file_scope(), uint32_t);
@@ -1650,7 +1653,7 @@ dissect_mp2t( tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U
         saved_proto = pinfo->current_proto;
         export_pdu(tvb_new_subset_length(tvb, offset, MP2T_PACKET_SIZE), pinfo);
         TRY {
-            mp2t_data = get_mp2t_conversation_data(stream);
+            mp2t_data = get_mp2t_conversation_data(stream, pinfo->num);
             dissect_tsp(tvb, offset, pinfo, tree, mp2t_data);
         }
         CATCH_NONFATAL_ERRORS {

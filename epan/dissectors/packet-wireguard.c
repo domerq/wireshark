@@ -23,6 +23,7 @@
 #include <epan/prefs.h>
 #include <epan/proto_data.h>
 #include <epan/conversation.h>
+#include <epan/ordinal.h>
 #include <epan/uat.h>
 #include <wsutil/file_util.h>
 #include <wsutil/filesystem.h>
@@ -267,7 +268,10 @@ typedef struct {
 
 /* Map from Sender/Receiver IDs to a list of session information. */
 static wmem_map_t *sessions;
-static uint32_t wg_session_count;
+
+/* Sessions are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t wg_stream_ordinal = ORDINAL_COUNTER_INIT("wg.stream");
 
 
 /* Key conversion routines. {{{ */
@@ -1043,10 +1047,10 @@ wg_sessions_insert(uint32_t id, wg_session_t *session)
 }
 
 static wg_session_t *
-wg_session_new(void)
+wg_session_new(uint32_t frame)
 {
     wg_session_t *session = wmem_new0(wmem_file_scope(), wg_session_t);
-    session->stream = wg_session_count++;
+    session->stream = ordinal_next(&wg_stream_ordinal, frame);
     return session;
 }
 
@@ -1401,7 +1405,7 @@ wg_dissect_handshake_initiation(tvbuff_t *tvb, packet_info *pinfo, proto_tree *w
     if (!PINFO_FD_VISITED(pinfo)) {
         /* XXX should an initiation message with the same contents (except MAC2) be
          * considered part of the same "session"? */
-        wg_session_t *session = wg_session_new();
+        wg_session_t *session = wg_session_new(pinfo->num);
         session->initiator_frame = pinfo->num;
         wg_session_update_address(session, pinfo, true);
         session->hs = hs;
@@ -1692,7 +1696,7 @@ dissect_wg_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 static void
 wg_init(void)
 {
-    wg_session_count = 0;
+    ordinal_counter_reset(&wg_stream_ordinal);
 }
 
 void
