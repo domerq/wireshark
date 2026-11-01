@@ -116,10 +116,9 @@ accepted. The rest are refused rather than approximated:
     -T json, jsonraw    the JSON writer puts the separators between
                         elements in as it goes, so each worker's spool
                         starts a fresh array.
-    -Y, -R              A worker cannot know whether a packet it never
-                        dissected would have passed a filter, so columns
-                        measured from the previous displayed packet would
-                        be measured from the wrong one.
+    -R                  A read filter drops packets before they are
+                        numbered, so the frame numbers would be each
+                        worker's own.
     -w, --export-pdu    There would be nothing to merge in frame order.
     -q                  Likewise.
     Windows             No fork().
@@ -130,6 +129,12 @@ capture's, but dissects only its own; the frames it does not own still
 advance what later packets are printed relative to. The reference frame
 is deliberately left for the second pass to find, since the first one
 only saw this worker's packets.
+
+A display filter (-Y) is supported, and costs the first pass: the
+workers record which of their frames passed, the parent merges those
+verdicts, and every worker gets the whole capture's set back. Without
+that, a column measured from the previous displayed packet would be
+measured from the previous packet this worker displayed.
 
 7. What it cannot refuse
 ------------------------
@@ -182,10 +187,9 @@ conversations, endpoints - with a capability flag on the tap, and
 refused for the ones that do not (stats_tree burst rates, io_graph
 frame-number tie-breaks).
 
-Filters, two-pass, and JSON. A display filter needs the previous
-displayed frame, which needs either an extra pass or a different
-definition of the delta columns. JSON needs the workers to emit
-elements that can be concatenated.
+JSON. The workers would have to emit elements that can be concatenated,
+which means the JSON writer putting its separators somewhere other than
+between the elements as it goes.
 
 The second pass. Output that shows an ordinal costs two dissections.
 The first one could be cheaper - it needs the conversations, not the

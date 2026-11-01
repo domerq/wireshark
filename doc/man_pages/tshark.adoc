@@ -2548,13 +2548,16 @@ would have produced, and hands it to the workers for the pass that
 prints. That doubles the dissection work, so summary output, which never
 shows such a field, skips it.
 
+A display filter costs the same extra pass, because a worker has to
+know which frames any worker displayed before it can say what "delta
+from previous displayed packet" means.
+
 This option works on a capture file only. It is refused with *-w*,
-*--export-pdu*, *-q*, *-z*, *-T json*, *-T jsonraw*, and read or
-display filters, because the result would not be the result of a
-single-process run: statistics would cover one worker's flows, the JSON
-writer puts separators between elements as it goes so the pieces cannot
-be concatenated, and a worker cannot tell whether a packet it did not
-dissect would have passed a filter.
+*--export-pdu*, *-q*, *-z*, *-T json*, *-T jsonraw*, and *-R*, because
+the result would not be the result of a single-process run: statistics
+would cover one worker's flows, the JSON writer puts separators between
+elements as it goes so the pieces cannot be concatenated, and a read
+filter drops packets before they are numbered.
 
 Dissection state that is not keyed on the addresses in the outer headers
 can still differ: traffic set up by signalling carried on another flow
