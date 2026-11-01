@@ -278,6 +278,72 @@ flow_shard_plan_new(const char *filename, unsigned shards, int *err,
     return plan;
 }
 
+/* Try the division again with a different number of workers. */
+static void
+flow_shard_reassign(flow_shard_plan_t *plan, unsigned shards)
+{
+    plan->shards = shards;
+    g_free(plan->shard_packets);
+    plan->shard_packets = g_new0(uint64_t, shards);
+    plan->shard_packets[0] = plan->unkeyed;
+    flow_shard_assign(plan);
+}
+
+double
+flow_shard_plan_speedup(const flow_shard_plan_t *plan)
+{
+    uint64_t busiest = 0;
+    unsigned i;
+
+    for (i = 0; i < plan->shards; i++) {
+        if (plan->shard_packets[i] > busiest) {
+            busiest = plan->shard_packets[i];
+        }
+    }
+
+    return busiest > 0 ? (double)plan->packets / (double)busiest : 1.0;
+}
+
+flow_shard_plan_t *
+flow_shard_plan_new_auto(const char *filename, unsigned max_shards,
+        int *err, char **err_info)
+{
+    flow_shard_plan_t *plan;
+    double             best = 1.0;
+    unsigned           best_shards = 1;
+    unsigned           shards;
+
+    ws_assert(max_shards > 0);
+
+    plan = flow_shard_plan_new(filename, max_shards, err, err_info);
+    if (plan == NULL) {
+        return NULL;
+    }
+
+    /* What the biggest division manages is the ceiling; anything that
+     * gets close to it with fewer workers is better, because a worker
+     * that adds nothing still reads the whole file. */
+    best = flow_shard_plan_speedup(plan);
+
+    for (shards = 1; shards < max_shards; shards++) {
+        double speedup;
+
+        flow_shard_reassign(plan, shards);
+        speedup = flow_shard_plan_speedup(plan);
+        if (speedup >= best * 0.95) {
+            best_shards = shards;
+            break;
+        }
+        best_shards = max_shards;
+    }
+
+    if (plan->shards != best_shards) {
+        flow_shard_reassign(plan, best_shards);
+    }
+
+    return plan;
+}
+
 void
 flow_shard_plan_free(flow_shard_plan_t *plan)
 {

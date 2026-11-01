@@ -2480,8 +2480,10 @@ keeps everything in memory, and two-pass analysis (*-2*) is supported.
 --spill-after <size>::
 +
 --
-How much dissection state to keep in RAM, in MB, before *--spill-dir* starts
-using the disk (default 2048). A value of 0 sends everything to the file.
+How much dissection state to keep in RAM before *--spill-dir* starts using
+the disk (default 2048 MB). A plain number is megabytes; a K, M, G or T
+suffix, with or without a following B, counts in powers of 1024, so "2048",
+"2G" and "2GB" are the same. A value of 0 sends everything to the file.
 
 The cost of spilling is proportional to how much ends up on disk, so this is
 the knob that trades speed for capacity: set it to what the machine can
@@ -2493,7 +2495,8 @@ capture.
 --spill-reserve <size>::
 +
 --
-Address space, in MB, to map for *--spill-dir* up front (default 65536). It
+Address space to map for *--spill-dir* up front (default 65536 MB), in the
+same units as *--spill-after*. It
 is not an amount of memory or of disk space that is consumed up front, since
 both the mapping and the file are sparse, and it is not a ceiling: state that
 outgrows it causes another mapping of the same size to be added. Raising it
@@ -2519,6 +2522,31 @@ The report gives the packet count for each worker against an even division,
 which is what says whether a worker count makes sense for a capture: a
 capture dominated by one conversation cannot be divided, however many
 workers are asked for.
+--
+
+--parallel::
++
+--
+Dissect the capture file in several processes instead of one, each taking
+whole flows, and work out how many processes from the capture itself.
+
+How far a capture divides is a property of the capture: one conversation
+that is a third of the packets caps the speedup at three however many
+processes are started. *TShark* therefore reads the file once to count
+packets per flow -- the pass *--shard-plan* reports -- tries each worker
+count up to the number of processors, and takes the smallest one that gets
+close to the best division any of them manage. It says on standard error
+what it chose and what the division is worth.
+
+Output that shows a conversation index needs a second dissection pass to
+work the numbering out, which halves what the division is worth, and
+forking, reading the file once per worker and copying each worker's output
+through the parent all cost something. If what is left is not clearly
+better than one process, *TShark* says so and dissects in one process.
+
+Use *--jobs* instead to say how many processes to use, which is what a
+measurement or a test wants, or when you know more about the cost of your
+traffic than a packet count can say.
 --
 
 --jobs <count>::
