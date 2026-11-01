@@ -41,12 +41,17 @@ typedef struct flow_shard_plan flow_shard_plan_t;
  * Reads the whole file once, parsing only enough of each packet to find
  * the addresses. Nothing is dissected.
  *
+ * A file that stops in the middle of a packet is planned as far as it
+ * goes: whoever reads it next reaches the same point and reports the
+ * same error as a single process would.
+ *
  * @param filename The capture file to plan for.
  * @param shards Number of workers to divide the packets between.
- * @param err Set to a wiretap error code if the file cannot be read.
+ * @param err Set to a wiretap error code if the file could not be opened
+ *            or could not be read to the end.
  * @param err_info Set to a newly allocated error string, which the caller
- *            must g_free(), for errors that have one.
- * @return The plan, or NULL on failure.
+ *            must g_free(), if the file could not be opened.
+ * @return The plan, or NULL if the file could not be opened.
  */
 flow_shard_plan_t *
 flow_shard_plan_new(const char *filename, unsigned shards, int *err,
