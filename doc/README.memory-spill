@@ -158,51 +158,53 @@ wmem_in_scope() first.
 Nothing is written while state is under the --spill-after watermark, so a
 capture that fits in RAM is unaffected. Past it, the cost is page faults and
 writeback on the part that went to disk, because eviction is page-granular
-while the access pattern is flow-granular. The same 4.1 GB capture (9.53 M
-packets, 8954 MB of state, -z conv,tcp) at different watermarks:
+while the access pattern is flow-granular.
 
-    watermark      in RAM    spilled     wall
-    no spilling        -          -       36 s
-    16384 MB      8954 MB       0 MB      36 s
-     6144 MB      6136 MB    2818 MB      47 s
-     2048 MB      2045 MB    6909 MB     431 s
-        0 MB           0    8954 MB      698 s
+The capture used below is five days of the 2015-03 traffic merged into one
+file (mergecap of 2015-03-05 through 2015-03-09): 1589 MB, 2033 k packets,
+2703 MB of dissection state under -z conv,tcp. At different watermarks, with
+every malloc-family allocation accounted by the interposer in test/benchmark:
+
+    watermark      in RAM    spilled     wall   peak heap
+    no spilling        -          -      9.8 s    2773 MB
+    8192 MB       2703 MB       0 MB     9.0 s    2773 MB
+    1024 MB       1016 MB    1687 MB    18.0 s    1083 MB
+       0 MB            0    2703 MB     40.2 s      67 MB
 
 So the penalty tracks how much is on disk, and the watermark is the knob that
 trades speed for capacity rather than a switch that makes everything slow.
+Every run produced -z conv,tcp output identical (cmp) to the run with no
+spilling.
 
 Flow-sharded parallelism helps more than it looks like it should, because it
-shrinks the working set each process touches. Four workers on flow-disjoint
-shards of the same capture, each holding ~2.3 GB of state:
+shrinks the working set each process touches. The same capture printed as
+packet summaries, one process against --jobs 4 (which taps cannot use yet, so
+this is the printing path rather than -z conv,tcp):
 
-    4 workers, no spilling                      11 s
-    4 workers, watermark 4096 MB (nothing spills) 11 s
-    4 workers, watermark 0 (everything spills)  23 s
+    1 process, no spilling                      10.9 s
+    4 workers, no spilling                       5.7 s
+    4 workers, watermark 0 (everything spills)   5.9 s
 
-23 s against 698 s for one process spilling the same total state: one process
-randomly touching a 9 GB arena misses cache constantly, four touching 2.3 GB
-arenas do not.
+Each worker held 605 to 1194 MB of state, and the sharded output was
+identical with and without spilling. Spilling all of it costs 4% there
+against 4.1x for one process spilling the same total state: one process
+randomly touching a 2.7 GB arena misses cache constantly, four touching
+sub-gigabyte arenas do not.
 
-Smaller captures and other shapes, at watermark 0 (worst case):
+Other shapes, at watermark 0 (worst case), against the same run without
+--spill-dir:
 
-    capture                            in RAM     spilled    peak heap spilled
-    real, 199 k packets                 0.84 s      0.81 s       187 MB
-    synthetic 2 M packets, 50 k flows   7.25 s      7.17 s        46 MB
-    synthetic 1 M packets, 500 k flows  4.16 s     14.2  s        47 MB
+    capture                            in RAM     spilled   spilled   peak
+                                                             state    heap
+    synthetic 2 M packets, 50 k flows   5.1 s      6.4 s      688 MB   63 MB
+    synthetic 1 M packets, 500 k flows  3.7 s     45.9 s     2240 MB  232 MB
 
-(macOS 27 on APFS, 10 cores, 16 GB.)
+(macOS 27.0.1 on APFS, Apple M4, 10 cores, 16 GB.)
 
-The third row is the adversarial case: 500 k flows touched round-robin, so no
-flow is ever in cache. MADV_RANDOM is what makes it tolerable - without it
-that run took 40.9 s, because readahead multiplied every fault.
-
-Host matters as much as workload. The 9.53 M packet capture at watermark 0,
-same code, in a Linux container on ext4 (8 cores, 10 GB):
-
-    real, 9.53 M packets / 4.1 GB      70.8   s    118    s
-
-1.7x rather than 19x. Writeback of randomly dirtied pages, not the spilling
-itself, is what differs between the two systems.
+The second row is the adversarial case: 500 k flows touched round-robin, so
+no flow is ever in cache, and the run is almost entirely system time
+faulting pages back. MADV_RANDOM is what keeps it to that, rather than
+having readahead multiply every fault.
 
 8. Limits and next steps
 ------------------------
@@ -273,13 +275,26 @@ wmem_backing_file_new() fails there and --spill-dir reports the error.
 Resident set size is a misleading measure on both platforms: resident pages
 of the backing file count towards it even though they are evictable without
 swap. On macOS use "peak memory footprint" or the malloc interposer in
-test/benchmark; on Linux use a cgroup limit, which is also the clearest
-demonstration - under "docker run --memory=1g" the unmodified run is
-OOM-killed (SIGKILL) after 3 s having produced nothing, while the same run
-with "--spill-dir /work --spill-after 0" completes with identical output
-and a resident set bounded by the limit. Any such demonstration has to set
-the watermark below the limit it is imposing, or the store spends its heap
-allowance first and dies exactly like the unmodified run.
+test/benchmark, which fails allocations past a budget and so makes running
+out of memory deterministic; on Linux a cgroup limit does the same thing
+without a shim.
+
+That interposer is also the clearest demonstration of what the option buys.
+On the merged 2015-03-05..09 capture of section 7 (2033 k packets, 2703 MB
+of state) with a 1024 MB malloc budget, -q -z conv,tcp:
+
+    unmodified                        dies after 2.8 s, nothing produced
+                                      ("GLib ERROR failed to allocate
+                                      8388608 bytes", abort)
+    --spill-dir /tmp/spill            dies the same way after 2.8 s
+    --spill-dir --spill-after 512     completes in 14.4 s, peak heap 575 MB,
+                                      507 MB in RAM and 2196 MB spilled
+
+The last run's output is byte-identical (cmp) to an unconstrained run. The
+middle row is the trap: --spill-after defaults to 2048 MB, which is above
+the 1024 MB budget, so the store spends its heap allowance first and dies
+exactly like the unmodified run. Any such demonstration has to set the
+watermark below the limit it is imposing.
 
 10. Reproducing the measurements
 --------------------------------
