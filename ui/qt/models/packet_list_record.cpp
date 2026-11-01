@@ -26,30 +26,35 @@
 
 #include <QStringList>
 
+#include <utility>
+
 QCache<uint32_t, QStringList> PacketListRecord::col_text_cache_(500);
 bool PacketListRecord::dissection_paused_ = false;
 QMap<int, int> PacketListRecord::cinfo_column_;
 unsigned PacketListRecord::rows_color_ver_ = 1;
 bool PacketListRecord::any_tag_column_ = false;
+const PacketListRecord::TagData PacketListRecord::empty_tag_data_;
 
 PacketListRecord::PacketListRecord(frame_data *frameData) :
     fdata_(frameData),
+    color_filters_(NULL),
+    tag_data_(NULL),
     lines_(1),
-    line_count_changed_(false),
     color_ver_(0),
-    colorized_(false),
     conv_index_(0),
-    read_failed_(false),
     row_(0),
     expert_severity_(0),
-    color_filters_(NULL),
-    color_filter_count_(0)
+    color_filter_count_(0),
+    line_count_changed_(false),
+    colorized_(false),
+    read_failed_(false)
 {
 }
 
 PacketListRecord::~PacketListRecord()
 {
     g_slist_free(color_filters_);
+    delete tag_data_;
 }
 
 void PacketListRecord::ensureColorized(capture_file *cap_file)
@@ -249,11 +254,14 @@ void PacketListRecord::dissect(capture_file *cap_file, bool dissect_columns, boo
         // (rather than glib-heap-allocated via g_slist_append) so they are
         // reclaimed automatically when the capture file closes, with no
         // explicit free needed even for a frame's last redissection.
-        tag_column_str_.clear();
-        tag_column_tip_.clear();
-        tag_column_segments_.clear();
-        tag_link_list_.clear();
+        //
+        // The display strings are built in a local TagData and only moved to
+        // the heap if some rule actually matched, so a record costs nothing
+        // but a NULL pointer unless it is really tagged.
+        delete tag_data_;
+        tag_data_ = NULL;
         if (any_tag_column_) {
+            TagData tag_data;
             const GSList *rule_list = tag_rules_get_list();
             int frame_proto_id = proto_get_id_by_filter_name("frame");
             p_remove_proto_data(wmem_file_scope(), &edt.pi, frame_proto_id, 1);
@@ -270,14 +278,14 @@ void PacketListRecord::dissect(capture_file *cap_file, bool dissect_columns, boo
                     QString seg_url  = (rule->tag_url && rule->tag_url[0])
                         ? QString::fromUtf8(rule->tag_url) : QString();
                     if (!seg_text.isEmpty()) {
-                        if (!tag_column_str_.isEmpty() && tag_prefs.separator != '\0')
-                            tag_column_str_ += QChar::fromLatin1(tag_prefs.separator);
-                        tag_column_str_ += seg_text;
+                        if (!tag_data.column_str.isEmpty() && tag_prefs.separator != '\0')
+                            tag_data.column_str += QChar::fromLatin1(tag_prefs.separator);
+                        tag_data.column_str += seg_text;
                     }
-                    tag_column_segments_.append(qMakePair(seg_text, seg_url));
+                    tag_data.column_segments.append(qMakePair(seg_text, seg_url));
                     if (!seg_url.isEmpty()) {
                         QString link_name = QString::fromUtf8(rule->rule_name);
-                        tag_link_list_.append(qMakePair(link_name, seg_url));
+                        tag_data.link_list.append(qMakePair(link_name, seg_url));
                     }
                     QString tip_line = QString::fromUtf8(rule->rule_name);
                     if (rule->comment && rule->comment[0])
@@ -295,7 +303,10 @@ void PacketListRecord::dissect(capture_file *cap_file, bool dissect_columns, boo
                     tag_names_tail = node;
                 }
             }
-            tag_column_tip_ = tip_lines.join(QStringLiteral("\n"));
+            if (!tip_lines.isEmpty()) {
+                tag_data.column_tip = tip_lines.join(QStringLiteral("\n"));
+                tag_data_ = new TagData(std::move(tag_data));
+            }
             if (tag_names) {
                 p_add_proto_data(wmem_file_scope(), &edt.pi, frame_proto_id, 1, tag_names);
             }
