@@ -29,6 +29,8 @@
 
 #ifndef _WIN32
 #include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #include <glib.h>
@@ -42,6 +44,7 @@
 #include <ui/urls.h>
 #include <wsutil/filesystem.h>
 #include <wsutil/file_util.h>
+#include <wsutil/tempfile.h>
 #include <wsutil/time_util.h>
 #include <wsutil/socket.h>
 #include <wsutil/privileges.h>
@@ -149,6 +152,7 @@
 #define LONGOPT_SPILL_RESERVE           LONGOPT_BASE_APPLICATION+14
 #define LONGOPT_SPILL_AFTER             LONGOPT_BASE_APPLICATION+15
 #define LONGOPT_SHARD_PLAN              LONGOPT_BASE_APPLICATION+16
+#define LONGOPT_JOBS                    LONGOPT_BASE_APPLICATION+17
 
 capture_file cfile;
 
@@ -167,6 +171,17 @@ static uint64_t spill_after = UINT64_C(2) * 1024 * 1024 * 1024;
 static wmem_backing_t *capture_backing;
 
 static unsigned shard_plan_shards;
+
+/* Flow-sharded dissection. The plan says which worker owns a packet; a
+ * worker reads the whole file but dissects and prints only the packets
+ * it owns, into a spool file, recording where each packet's output
+ * landed. The parent writes the spools out in frame number order, which
+ * is the order one process would have printed them in. */
+static unsigned jobs;
+static flow_shard_plan_t *jobs_plan;
+static unsigned jobs_shard;
+static FILE *jobs_index_fp;
+static bool stats_requested;
 
 static uint32_t selected_frame_number;
 
@@ -395,6 +410,275 @@ print_shard_plan(const char *filename, unsigned shards)
 
     return EXIT_SUCCESS;
 }
+
+#ifndef _WIN32
+/* One record per packet a worker printed: which frame it was, and where
+ * its output sits in that worker's spool. */
+typedef struct {
+    uint64_t framenum;
+    uint64_t offset;
+    uint64_t length;
+} jobs_index_entry_t;
+
+typedef struct {
+    pid_t pid;
+    int   out_fd;
+    int   idx_fd;
+    FILE *idx_fp;               /* parent side, for reading back */
+    jobs_index_entry_t entry;
+    bool  have_entry;
+} jobs_worker_t;
+
+/* An unlinked temporary file: the workers inherit the descriptor, the
+ * parent reads it back, and nothing has to clean up after a crash. */
+static int
+jobs_spool_open(void)
+{
+    char *path = NULL;
+    int   fd;
+
+    fd = create_tempfile(NULL, &path, "wireshark_shard", NULL, NULL);
+    if (fd < 0) {
+        return -1;
+    }
+    ws_unlink(path);
+
+    return fd;
+}
+
+/* Called by a worker around printing one packet, so that the parent can
+ * find that packet's bytes again. */
+static void
+jobs_record_packet(uint32_t framenum, int64_t start)
+{
+    jobs_index_entry_t entry;
+    int64_t            end;
+
+    end = ws_ftell64(stdout);
+    if (end <= start) {
+        /* Nothing was printed for this packet: a read or display filter
+         * rejected it. */
+        return;
+    }
+
+    entry.framenum = framenum;
+    entry.offset   = (uint64_t)start;
+    entry.length   = (uint64_t)(end - start);
+
+    if (fwrite(&entry, sizeof(entry), 1, jobs_index_fp) != 1) {
+        cmdarg_err("Can't write the shard index: %s", g_strerror(errno));
+        exit(WS_EXIT_INVALID_FILE);
+    }
+}
+
+/* A packet another worker owns still contributes to the state that later
+ * packets are printed relative to: the frame numbering, the time
+ * reference, the previous frame and the cumulative byte count. Keep that
+ * up to date without dissecting, so that this worker's columns match what
+ * a single process would have printed. */
+static void
+jobs_skip_packet(capture_file *cf, wtap_rec *rec, int64_t offset)
+{
+    frame_data fdata;
+
+    cf->count++;
+
+    frame_data_init(&fdata, cf->count, rec, offset, cum_bytes);
+    frame_data_set_before_dissect(&fdata, &cf->elapsed_time,
+            &cf->provider.ref, cf->provider.prev_dis);
+    if (cf->provider.ref == &fdata) {
+        ref_frame = fdata;
+        cf->provider.ref = &ref_frame;
+    }
+    frame_data_set_after_dissect(&fdata, &cum_bytes);
+
+    /* Without a display filter every packet is displayed, so this is also
+     * the frame that "delta from previous displayed" is measured against.
+     * A worker cannot know whether a packet it never dissected would have
+     * passed a filter, which is why -Y and those columns do not mix. */
+    prev_dis_frame = fdata;
+    cf->provider.prev_dis = &prev_dis_frame;
+    prev_cap_frame = fdata;
+    cf->provider.prev_cap = &prev_cap_frame;
+
+    frame_data_destroy(&fdata);
+}
+
+static bool
+jobs_next_entry(jobs_worker_t *worker)
+{
+    worker->have_entry =
+        fread(&worker->entry, sizeof(worker->entry), 1, worker->idx_fp) == 1;
+
+    return worker->have_entry;
+}
+
+/* Write the workers' output in frame number order. */
+static bool
+jobs_merge(jobs_worker_t *workers, unsigned count)
+{
+    uint8_t *buf      = NULL;
+    size_t   buf_size = 0;
+    unsigned i;
+
+    for (i = 0; i < count; i++) {
+        if (lseek(workers[i].idx_fd, 0, SEEK_SET) == (off_t)-1) {
+            return false;
+        }
+        workers[i].idx_fp = fdopen(workers[i].idx_fd, "rb");
+        if (workers[i].idx_fp == NULL) {
+            return false;
+        }
+        jobs_next_entry(&workers[i]);
+    }
+
+    for (;;) {
+        jobs_worker_t *next = NULL;
+        ssize_t        got;
+
+        for (i = 0; i < count; i++) {
+            if (workers[i].have_entry &&
+                    (next == NULL ||
+                     workers[i].entry.framenum < next->entry.framenum)) {
+                next = &workers[i];
+            }
+        }
+        if (next == NULL) {
+            break;
+        }
+
+        if (next->entry.length > buf_size) {
+            buf_size = (size_t)next->entry.length;
+            buf      = (uint8_t *)g_realloc(buf, buf_size);
+        }
+
+        got = pread(next->out_fd, buf, (size_t)next->entry.length,
+                (off_t)next->entry.offset);
+        if (got != (ssize_t)next->entry.length) {
+            g_free(buf);
+            return false;
+        }
+        if (fwrite(buf, 1, (size_t)next->entry.length, stdout) !=
+                next->entry.length) {
+            g_free(buf);
+            return false;
+        }
+
+        jobs_next_entry(next);
+    }
+
+    g_free(buf);
+
+    return true;
+}
+
+/*
+ * Run the capture file across several processes, each dissecting whole
+ * flows. Returns true in a worker, which then reads the file as usual
+ * with its output going to a spool; returns false in the parent once the
+ * workers are done and their output has been written out, with the exit
+ * status in *exit_status.
+ */
+static bool
+jobs_fork(const char *filename, unsigned count, int *exit_status)
+{
+    jobs_worker_t *workers;
+    int            err = 0;
+    char          *err_info = NULL;
+    unsigned       i;
+    bool           failed = false;
+
+    jobs_plan = flow_shard_plan_new(filename, count, &err, &err_info);
+    if (jobs_plan == NULL) {
+        report_cfile_open_failure(filename, err, err_info);
+        *exit_status = WS_EXIT_INVALID_FILE;
+        return false;
+    }
+
+    workers = g_new0(jobs_worker_t, count);
+
+    for (i = 0; i < count; i++) {
+        workers[i].out_fd = jobs_spool_open();
+        workers[i].idx_fd = jobs_spool_open();
+        if (workers[i].out_fd < 0 || workers[i].idx_fd < 0) {
+            cmdarg_err("Can't create a spool file for worker %u: %s", i,
+                    g_strerror(errno));
+            *exit_status = WS_EXIT_INVALID_FILE;
+            goto fail;
+        }
+    }
+
+    /* Fork after epan_init(), so the dissector tables are set up once and
+     * shared copy-on-write, and so that each worker inherits a complete,
+     * identical plan. */
+    for (i = 0; i < count; i++) {
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            cmdarg_err("Can't start worker %u: %s", i, g_strerror(errno));
+            *exit_status = WS_EXIT_INIT_FAILED;
+            goto fail;
+        }
+        if (pid == 0) {
+            jobs_shard     = i;
+            jobs_index_fp  = fdopen(workers[i].idx_fd, "wb");
+            if (jobs_index_fp == NULL ||
+                    dup2(workers[i].out_fd, STDOUT_FILENO) < 0) {
+                cmdarg_err("Worker %u can't use its spool: %s", i,
+                        g_strerror(errno));
+                exit(WS_EXIT_INIT_FAILED);
+            }
+            g_free(workers);
+            return true;
+        }
+        workers[i].pid = pid;
+    }
+
+    for (i = 0; i < count; i++) {
+        int status = 0;
+
+        if (waitpid(workers[i].pid, &status, 0) < 0 ||
+                !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
+            cmdarg_err("Worker %u failed", i);
+            failed = true;
+        }
+    }
+
+    if (!failed) {
+        /* The preamble and the finale wrap the whole output, so they
+         * belong to the parent rather than to any worker. */
+        cfile.filename = g_strdup(filename);
+        if (!write_preamble(&cfile) || !jobs_merge(workers, count) ||
+                !write_finale()) {
+            cmdarg_err("Can't write the workers' output: %s",
+                    g_strerror(errno));
+            failed = true;
+        }
+        g_free(cfile.filename);
+        cfile.filename = NULL;
+    }
+
+    *exit_status = failed ? WS_EXIT_INVALID_FILE : EXIT_SUCCESS;
+
+fail:
+    for (i = 0; i < count; i++) {
+        if (workers[i].idx_fp != NULL) {
+            fclose(workers[i].idx_fp);
+        }
+        else if (workers[i].idx_fd > 0) {
+            ws_close(workers[i].idx_fd);
+        }
+        if (workers[i].out_fd > 0) {
+            ws_close(workers[i].out_fd);
+        }
+    }
+    g_free(workers);
+    flow_shard_plan_free(jobs_plan);
+    jobs_plan = NULL;
+
+    return false;
+}
+#endif /* _WIN32 */
 
 static void
 list_capture_types(void)
@@ -663,6 +947,8 @@ print_usage(FILE *output)
     fprintf(output, "                           (def: %" PRIu64 "MB)\n", spill_reserve / (1024 * 1024));
     fprintf(output, "  --shard-plan <count>     print how this capture would divide between <count>\n");
     fprintf(output, "                           workers that each dissect whole flows, and exit\n");
+    fprintf(output, "  --jobs <count>           dissect the capture in <count> processes, each taking\n");
+    fprintf(output, "                           whole flows (def: 1)\n");
     fprintf(output, "\n");
 
     ws_log_print_usage(output);
@@ -1162,6 +1448,7 @@ main(int argc, char *argv[])
         {"spill-reserve", ws_required_argument, NULL, LONGOPT_SPILL_RESERVE},
         {"spill-after", ws_required_argument, NULL, LONGOPT_SPILL_AFTER},
         {"shard-plan", ws_required_argument, NULL, LONGOPT_SHARD_PLAN},
+        {"jobs", ws_required_argument, NULL, LONGOPT_JOBS},
         {0, 0, 0, 0}
     };
     bool                 arg_error = false;
@@ -1424,6 +1711,19 @@ main(int argc, char *argv[])
                     exit_status = WS_EXIT_INVALID_OPTION;
                     goto clean_exit;
                 }
+                break;
+            case LONGOPT_JOBS:
+                if (!ws_strtou32(ws_optarg, NULL, &jobs) || jobs == 0) {
+                    cmdarg_err("\"%s\" isn't a valid number of jobs",
+                            ws_optarg);
+                    exit_status = WS_EXIT_INVALID_OPTION;
+                    goto clean_exit;
+                }
+#ifdef _WIN32
+                cmdarg_err("--jobs is not supported on this platform");
+                exit_status = WS_EXIT_INVALID_OPTION;
+                goto clean_exit;
+#endif
                 break;
             case 'h':
             case 'v':
@@ -1978,6 +2278,7 @@ main(int argc, char *argv[])
             case LONGOPT_SPILL_RESERVE:
             case LONGOPT_SPILL_AFTER:
             case LONGOPT_SHARD_PLAN:
+            case LONGOPT_JOBS:
                 /* already processed; just ignore it now */
                 break;
             case 'Y':
@@ -2001,6 +2302,7 @@ main(int argc, char *argv[])
                     exit_status = WS_EXIT_INVALID_OPTION;
                     goto clean_exit;
                 }
+                stats_requested = true;
                 break;
             case 'd':        /* Decode as rule */
             case 'K':        /* Kerberos keytab file */
@@ -2765,6 +3067,69 @@ main(int argc, char *argv[])
         exit_status = print_shard_plan(cf_name, shard_plan_shards);
         goto clean_exit;
     }
+
+#ifndef _WIN32
+    if (jobs > 1) {
+        /* Each worker prints its own packets and the parent puts them back
+         * in order, so there has to be per-packet output to put in order,
+         * and nothing else may be writing to stdout or to a file. */
+        if (cf_name == NULL) {
+            cmdarg_err("--jobs requires a capture file");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        if (!print_packet_info || output_file_name != NULL ||
+                pdu_export_arg != NULL) {
+            cmdarg_err("--jobs only supports printing packets, not -w, "
+                    "--export-pdu or -q");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        if (stats_requested) {
+            /* Folding the accumulators of each tap back together is
+             * tap-specific work that has not been done. Refusing is the
+             * only honest option: the numbers would otherwise be wrong. */
+            cmdarg_err("--jobs cannot be used with -z; the statistics would "
+                    "only cover one worker's flows");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        if (output_action != WRITE_TEXT || print_details) {
+            /* Conversation index fields - tcp.stream and the rest - are
+             * numbered in the order the conversations are created, which
+             * in a worker is the order of its own flows and not of the
+             * capture's. Summary columns do not carry them; packet
+             * details and the structured formats do, so they would come
+             * out differently from a single-process run. */
+            cmdarg_err("--jobs only supports summary output; packet details "
+                    "and -T formats other than text number conversations "
+                    "per worker");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        if (rfcode != NULL || dfcode != NULL) {
+            /* A worker does not dissect the packets it does not own, so
+             * it cannot know whether they would have passed a filter, and
+             * columns measured from the previous displayed packet would
+             * be measured from the wrong one. */
+            cmdarg_err("--jobs cannot be used with a read or display "
+                    "filter");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        if (perform_two_pass_analysis) {
+            cmdarg_err("--jobs cannot be used with -2");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+
+        if (!jobs_fork(cf_name, jobs, (int *)&exit_status)) {
+            goto clean_exit;
+        }
+        /* A worker: carry on and read the file, printing the packets this
+         * worker owns into its spool. */
+    }
+#endif
 
     if (cf_name) {
         ws_debug("tshark: Opening capture file: %s", cf_name);
@@ -4224,6 +4589,7 @@ process_cap_file_single_pass(capture_file *cf, wtap_dumper *pdh,
     int64_t         data_offset;
     pass_status_t   status = PASS_SUCCEEDED;
     bool            visible = false;
+    int64_t         packet_start = 0;
 
     wtap_rec_init(&rec, DEFAULT_INIT_BUFFER_SIZE_2048);
 
@@ -4300,6 +4666,21 @@ process_cap_file_single_pass(capture_file *cf, wtap_dumper *pdh,
 
         reset_epan_mem(cf, edt, create_proto_tree, visible);
 
+#ifndef _WIN32
+        if (jobs_plan != NULL) {
+            if (flow_shard_plan_shard_of(jobs_plan,
+                        rec.rec_header.packet_header.pkt_encap,
+                        ws_buffer_start_ptr(&rec.data),
+                        rec.rec_header.packet_header.caplen) != jobs_shard) {
+                /* Another worker owns this flow. */
+                jobs_skip_packet(cf, &rec, data_offset);
+                wtap_rec_reset(&rec);
+                continue;
+            }
+            packet_start = ws_ftell64(stdout);
+        }
+#endif
+
         switch (process_packet_single_pass(cf, edt, data_offset, &rec,
                                            tap_flags)) {
         case PROCESS_PACKET_PASSED:
@@ -4333,6 +4714,12 @@ process_cap_file_single_pass(capture_file *cf, wtap_dumper *pdh,
             got_printing_error = true;
             break;
         }
+
+#ifndef _WIN32
+        if (jobs_plan != NULL) {
+            jobs_record_packet((uint32_t)framenum, packet_start);
+        }
+#endif
         /* Stop reading if we hit a stop condition */
         if (max_packet_count > 0 && framenum >= max_packet_count) {
             ws_debug("tshark: max_packet_count (%d) reached", max_packet_count);
@@ -4446,8 +4833,10 @@ process_cap_file(capture_file *cf, char *save_file, int out_file_type,
             goto out;
         }
     } else {
-        /* Set up to print packet information. */
-        if (print_packet_info) {
+        /* Set up to print packet information. A worker prints only its
+         * own packets into a spool, so the preamble and the finale are
+         * the parent's to write. */
+        if (print_packet_info && jobs_plan == NULL) {
             if (!write_preamble(cf)) {
                 show_print_file_io_error();
                 status = PROCESS_FILE_NO_FILE_PROCESSED;
@@ -4667,7 +5056,7 @@ process_cap_file(capture_file *cf, char *save_file, int out_file_type,
             status = PROCESS_FILE_WRITE_ERROR;
         }
     } else {
-        if (print_packet_info) {
+        if (print_packet_info && jobs_plan == NULL) {
             if (!write_finale()) {
                 show_print_file_io_error();
                 status = PROCESS_FILE_PRINT_ERROR;

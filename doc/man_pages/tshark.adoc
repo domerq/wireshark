@@ -2505,6 +2505,33 @@ capture dominated by one conversation cannot be divided, however many
 workers are asked for.
 --
 
+--jobs <count>::
++
+--
+Dissect the capture file in __count__ processes instead of one. The
+division is the one *--shard-plan* reports: each worker dissects whole
+flows, so no conversation, reassembly or sequence analysis is split across
+processes. *TShark* prints the packets in their original order, so the
+output is byte for byte what a single process would have produced.
+
+Workers are forked after the dissectors are registered, so the
+registration tables are built once and shared. Each worker reads the whole
+file but dissects only the packets it owns, and keeps the frame numbering
+and the time reference of the capture as a whole.
+
+The speedup is bounded by the largest flow: a capture where one
+conversation is a third of the packets cannot go more than three times
+faster, whatever __count__ is. Run *--shard-plan* first to see.
+
+This option works on a capture file only, and only for summary output.
+It is refused with *-w*, *--export-pdu*, *-q*, *-2*, *-z*, *-V*, *-T*
+formats other than text, and read or display filters, because the result
+would not be the result of a single-process run: conversation index fields
+such as __tcp.stream__ are numbered per worker, statistics would cover one
+worker's flows, and a worker cannot tell whether a packet it did not
+dissect would have passed a filter.
+--
+
 // Add a "capture-options" group for the common capture options?
 // Note a few options have different behavior in tshark, like -w,
 // because they operate on both live capture and when reading from file.
