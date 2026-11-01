@@ -105,14 +105,56 @@ different output.
 The cost is that dissection happens twice, so this is skipped for
 summary output.
 
-6. What it refuses
+6. Statistics that fold
+-----------------------
+
+A tap accumulates, and a worker's accumulator covers the flows it was
+given. For the conversation and endpoint tables (-z conv,<type> and -z
+endpoints,<type>) the accumulator is a list of rows - two addresses, two
+ports, frames and bytes each way, first and last time - and rows add up.
+
+So each worker, instead of printing its table, writes its rows to a
+spool, and the parent adds together the rows that are the same
+conversation: same type, same address pair, same ports. Folding, not
+deduplicating. A conversation can legitimately be in two workers' tables,
+because the inner header of an ICMP error names a flow that belongs to
+someone else, and then each of them has counted part of it. A worker that
+met the conversation from the other end has its own idea of which
+direction is which, so the fold keys on the pair in a fixed order and
+turns the counters round to match.
+
+The parent then creates the same tables the -z arguments asked for -
+which is the same code any other run creates them with - fills them with
+the folded rows and prints them through the same draw functions. The
+formatting, the sort order and the totals cannot drift from a serial run
+because they are not reimplemented.
+
+The draw functions print rows largest first and break ties by the order
+the rows were created, so the order has to be the capture's rather than
+each worker's. Every worker records the frame that created each of its
+rows; no two workers share a frame, so sorting the folded rows by that
+frame is the order one process would have built them in, and a row two
+workers created is the earlier of the two - which is where a single
+process would have created it, and the direction it would have had.
+
+What is not folded is the conversation id, which is each worker's own
+numbering of its own flows, and the dissector info block, which is a
+per-dissector static that only the filter names the GUI builds come out
+of. Neither reaches the printed table.
+
+Network name resolution (-N n) is refused along with -z: a name a worker
+learned from a DNS response in the capture belongs to that worker, and
+the parent that prints the table never dissected anything.
+
+7. What it refuses
 ------------------
 
 Only cases where the output would match a single-process run are
 accepted. The rest are refused rather than approximated:
 
-    -z                  tap accumulators would cover one worker's flows.
-                        Folding them back together is per-tap work.
+    -z, other than      the other tap accumulators cover one worker's
+    conv, endpoints     flows, and folding each of them back together
+                        is work only that tap can do.
     -T json, jsonraw    the JSON writer puts the separators between
                         elements in as it goes, so each worker's spool
                         starts a fresh array.
@@ -120,7 +162,8 @@ accepted. The rest are refused rather than approximated:
                         numbered, so the frame numbers would be each
                         worker's own.
     -w, --export-pdu    There would be nothing to merge in frame order.
-    -q                  Likewise.
+    -q                  Likewise, unless -z asks for a table that folds,
+                        which is then the whole output.
     Windows             No fork().
 
 Two-pass analysis (-2) is supported. Each worker indexes every packet,
@@ -136,7 +179,7 @@ verdicts, and every worker gets the whole capture's set back. Without
 that, a column measured from the previous displayed packet would be
 measured from the previous packet this worker displayed.
 
-7. What it cannot refuse
+8. What it cannot refuse
 ------------------------
 
 Dissection state keyed on something other than the addresses in the
@@ -157,7 +200,7 @@ before dissection can know about those relationships, so --jobs says on
 stderr that it dissects flows independently rather than quietly
 differing.
 
-8. Cost
+9. Cost
 -------
 
 A real 526 MB capture, 749 804 packets, 669 address pairs, summary output:
@@ -179,13 +222,14 @@ to an unspilled run in both cases. Sharding and spilling help each other:
 each worker holds a fraction of the state (176, 200, 419 and 924 MB here,
 against 1528 MB in one process), and a smaller arena is a warmer one.
 
-9. Limits and next steps
-------------------------
+10. Limits and next steps
+-------------------------
 
-Mergeable taps. -z could be supported for the accumulators that fold -
-conversations, endpoints - with a capability flag on the tap, and
-refused for the ones that do not (stats_tree burst rates, io_graph
-frame-number tie-breaks).
+More taps. The conversation and endpoint tables fold because their
+accumulator is a list of rows; the rest do not, and each of them is its
+own piece of work (stats_tree burst rates, io_graph frame-number
+tie-breaks). What the two that do fold have in common is a table the
+parent can be handed, not a flag on the tap.
 
 JSON. The workers would have to emit elements that can be concatenated,
 which means the JSON writer putting its separators somewhere other than
@@ -195,13 +239,13 @@ The second pass. Output that shows an ordinal costs two dissections.
 The first one could be cheaper - it needs the conversations, not the
 fields - but nothing in epan distinguishes those today.
 
-Affinity. The answer to section 7 is to let a worker that discovers a
+Affinity. The answer to section 8 is to let a worker that discovers a
 relationship - SDP announcing a media address, a tunnel carrying a flow
 that belongs elsewhere - hand that flow to the worker that owns the
 other end, which means the plan has to be adjustable while the run is
 in progress.
 
-10. Reproducing the measurements
+11. Reproducing the measurements
 --------------------------------
 
 test/benchmark/gen_pcap.py generates captures with an exact packet and

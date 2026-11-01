@@ -2552,12 +2552,25 @@ A display filter costs the same extra pass, because a worker has to
 know which frames any worker displayed before it can say what "delta
 from previous displayed packet" means.
 
+*-z conv,__type__* and *-z endpoints,__type__* are supported. A worker's
+table covers only the flows it was given, so each worker hands its rows
+to the parent, which adds up the rows that are the same conversation --
+a conversation both of them saw, because the inner header of an ICMP
+error names a flow that belongs to another worker, is folded rather than
+counted twice -- and prints the result through the same code a single
+process prints its table with. Since that table may be the only output,
+*-q* is allowed when *-z* asks for one of them.
+
 This option works on a capture file only. It is refused with *-w*,
-*--export-pdu*, *-q*, *-z*, *-T json*, *-T jsonraw*, and *-R*, because
-the result would not be the result of a single-process run: statistics
-would cover one worker's flows, the JSON writer puts separators between
-elements as it goes so the pieces cannot be concatenated, and a read
-filter drops packets before they are numbered.
+*--export-pdu*, *-T json*, *-T jsonraw*, *-R*, and with any other *-z*,
+because the result would not be the result of a single-process run: the
+other statistics accumulate in a shape only the tap that built them
+knows how to fold, the JSON writer puts separators between elements as
+it goes so the pieces cannot be concatenated, and a read filter drops
+packets before they are numbered. *-z* is also refused together with
+network name resolution (*-N n*), since a name a worker learned from a
+DNS response in the capture is not one the parent printing the table
+knows.
 
 Dissection state that is not keyed on the addresses in the outer headers
 can still differ: traffic set up by signalling carried on another flow
