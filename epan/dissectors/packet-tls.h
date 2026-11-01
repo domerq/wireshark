@@ -110,6 +110,6 @@ const char *
 tls_get_client_alpn(SslDecryptSession *tls_session);
 
 extern uint32_t
-tls_increment_stream_count(void);
+tls_increment_stream_count(uint32_t frame);
 
 #endif  /* __PACKET_TLS_H__ */

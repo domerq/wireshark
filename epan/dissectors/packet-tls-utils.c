@@ -5283,7 +5283,7 @@ tls_get_session(conversation_t *conversation, int proto_ssl, uint8_t curr_layer_
 
 /* get ssl data for this session. if no ssl data is found allocate a new one*/
 SslDecryptSession *
-ssl_get_session(conversation_t *conversation, dissector_handle_t tls_handle, uint8_t curr_layer_num)
+ssl_get_session(conversation_t *conversation, dissector_handle_t tls_handle, uint8_t curr_layer_num, uint32_t frame)
 {
     void               *conv_data;
     SslDecryptSession  *ssl_session;
@@ -5357,9 +5357,9 @@ ssl_get_session(conversation_t *conversation, dissector_handle_t tls_handle, uin
      * doesn't get sent to the TLS follow tap.)
      */
     if (tls_handle == base_tls_handle) {
-        ssl_session->session.stream = tls_increment_stream_count();
+        ssl_session->session.stream = tls_increment_stream_count(frame);
     } else if (tls_handle == dtls_handle) {
-        ssl_session->session.stream = dtls_increment_stream_count();
+        ssl_session->session.stream = dtls_increment_stream_count(frame);
     }
 
     /* Store the session in the wmem map indexed by layer number */
@@ -5441,7 +5441,7 @@ tls_set_appdata_dissector(dissector_handle_t tls_handle, packet_info *pinfo,
     uint8_t         curr_layer_num = p_get_proto_depth(pinfo, proto);
 
     conversation = find_or_create_conversation(pinfo);
-    session = &ssl_get_session(conversation, tls_handle, curr_layer_num)->session;
+    session = &ssl_get_session(conversation, tls_handle, curr_layer_num, pinfo->num)->session;
     session->app_handle = app_handle;
 }
 
@@ -5467,7 +5467,7 @@ ssl_starttls(dissector_handle_t tls_handle, packet_info *pinfo,
     DISSECTOR_ASSERT(app_handle);
 
     conversation = find_or_create_conversation(pinfo);
-    session = &ssl_get_session(conversation, tls_handle, curr_layer_num)->session;
+    session = &ssl_get_session(conversation, tls_handle, curr_layer_num, pinfo->num)->session;
 
     ssl_debug_printf("%s: old frame %d, app_handle=%p (%s)\n", G_STRFUNC,
                      session->last_nontls_frame,

@@ -37,6 +37,7 @@
 #include "config.h"
 
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/to_str.h>
 #include <epan/asn1.h>
 #include <epan/tap.h>
@@ -239,7 +240,9 @@ static uint32_t dtls_default_server_cid_length;
 
 static heur_dissector_list_t heur_subdissector_list;
 
-static uint32_t dtls_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t dtls_stream_ordinal = ORDINAL_COUNTER_INIT("dtls.stream");
 
 static const fragment_items dtls_frag_items = {
   /* Fragment subtrees */
@@ -268,12 +271,12 @@ static SSL_COMMON_LIST_T(dissect_dtls_hf);
 
 static uint32_t get_dtls_stream_count(void)
 {
-  return dtls_stream_count;
+  return dtls_stream_ordinal.next;
 }
 
-uint32_t dtls_increment_stream_count(void)
+uint32_t dtls_increment_stream_count(uint32_t frame)
 {
-  return dtls_stream_count++;
+  return ordinal_next(&dtls_stream_ordinal, frame);
 }
 
 /* initialize/reset per capture state data (dtls sessions cache) */
@@ -285,7 +288,7 @@ dtls_init(void)
 
   ssl_init_cid_list();
 
-  dtls_stream_count = 0;
+  ordinal_counter_reset(&dtls_stream_ordinal);
 }
 
 static void
@@ -506,7 +509,7 @@ dissect_dtls(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_
 
   /* if session cannot be retrieved from connection ID, get or create it from conversation */
   if (ssl_session == NULL) {
-      ssl_session = ssl_get_session(conversation, dtls_handle, curr_layer_num_ssl);
+      ssl_session = ssl_get_session(conversation, dtls_handle, curr_layer_num_ssl, pinfo->num);
   }
 
   session = &ssl_session->session;

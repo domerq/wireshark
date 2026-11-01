@@ -653,9 +653,11 @@ SslDecryptSession *ssl_get_session_by_cid(tvbuff_t *tvb, uint32_t offset);
  * @param conversation The SSL conversation.
  * @param tls_handle The dissector handle for SSL or DTLS.
  * @param curr_layer_num The current protocol layer number (for nested TLS support).
+ * @param frame The frame number being dissected, which is what orders the
+ *   stream numbers handed to new sessions.
  */
 extern SslDecryptSession *
-ssl_get_session(conversation_t *conversation, dissector_handle_t tls_handle, uint8_t curr_layer_num);
+ssl_get_session(conversation_t *conversation, dissector_handle_t tls_handle, uint8_t curr_layer_num, uint32_t frame);
 
 /** Look up an existing SslDecryptSession for a conversation without creating one.
  * Used by functions that query session state (cipher info, ALPN, exporters, etc.)
