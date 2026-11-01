@@ -84,6 +84,7 @@
 #include "ui/decode_as_utils.h"
 #include "wsutil/filter_files.h"
 #include "ui/cli/tshark-tap.h"
+#include "ui/cli/conv-merge.h"
 #include "ui/cli/tap-exportobject.h"
 #include "ui/cli/cli_common.h"
 #include "ui/tap_export_pdu.h"
@@ -184,6 +185,9 @@ static unsigned jobs_shard;
 static FILE *jobs_index_fp;
 static unsigned jobs_pass;
 static bool stats_requested;
+/* The first -z argument whose accumulators the parent cannot fold back
+ * together, if there is one. */
+static const char *stats_unmergeable;
 
 static uint32_t selected_frame_number;
 
@@ -439,6 +443,7 @@ typedef struct {
     int   ord_fd;               /* ordinals: recorded, then handed back */
     int   names_fd;             /* counter id -> counter name */
     int   disp_fd;              /* frames that passed the display filter */
+    int   stats_fd;             /* the rows of this worker's -z tables */
     FILE *idx_fp;               /* parent side, for reading back */
     jobs_index_entry_t entry;
     bool  have_entry;
@@ -1008,6 +1013,36 @@ out:
     return ok;
 }
 
+/*
+ * Fold the workers' conversation and endpoint tables into the table a
+ * single process would have built, and print it.
+ *
+ * The tables are created here, in the parent, by the same code that the
+ * -z arguments would have created them with anywhere else, and printed
+ * by the same draw functions, so the formatting, the sort order and the
+ * totals cannot drift from a serial run. All the parent supplies is the
+ * rows.
+ */
+static bool
+jobs_merge_stats(jobs_worker_t *workers, unsigned count)
+{
+    int     *fds = g_new(int, count);
+    unsigned i;
+    bool     ok;
+
+    for (i = 0; i < count; i++) {
+        fds[i] = workers[i].stats_fd;
+    }
+
+    ok = start_requested_stats() && conv_merge_collect(fds, count);
+    if (ok) {
+        draw_tap_listeners(true);
+    }
+    g_free(fds);
+
+    return ok;
+}
+
 /* Worker side of starting a pass: take over the spools. */
 static void
 jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
@@ -1033,6 +1068,8 @@ jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
         }
         ordinal_set_provider(jobs_ordinal_collect, NULL);
         print_packet_info = false;
+        /* The tables this pass builds are thrown away with it. */
+        conv_merge_discard();
     }
     else {
         struct stat st;
@@ -1082,6 +1119,12 @@ jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
             cmdarg_err("Worker %u can't use its spool: %s", shard,
                     g_strerror(errno));
             exit(WS_EXIT_INIT_FAILED);
+        }
+
+        if (stats_requested) {
+            /* The rows of this worker's tables go to the parent, which
+             * folds every worker's together and prints the result. */
+            conv_merge_spool_to(worker->stats_fd);
         }
     }
 
@@ -1190,9 +1233,10 @@ jobs_fork(const char *filename, unsigned count, bool need_first_pass,
         workers[i].ord_fd   = jobs_spool_open();
         workers[i].names_fd = jobs_spool_open();
         workers[i].disp_fd  = jobs_spool_open();
+        workers[i].stats_fd = jobs_spool_open();
         if (workers[i].out_fd < 0 || workers[i].idx_fd < 0 ||
                 workers[i].ord_fd < 0 || workers[i].names_fd < 0 ||
-                workers[i].disp_fd < 0) {
+                workers[i].disp_fd < 0 || workers[i].stats_fd < 0) {
             cmdarg_err("Can't create a spool file for worker %u: %s", i,
                     g_strerror(errno));
             *exit_status = WS_EXIT_INVALID_FILE;
@@ -1228,7 +1272,7 @@ jobs_fork(const char *filename, unsigned count, bool need_first_pass,
         return true;
     }
 
-    if (!failed) {
+    if (!failed && print_packet_info) {
         /* The preamble and the finale wrap the whole output, so they
          * belong to the parent rather than to any worker. */
         cfile.filename = g_strdup(filename);
@@ -1240,6 +1284,12 @@ jobs_fork(const char *filename, unsigned count, bool need_first_pass,
         }
         g_free(cfile.filename);
         cfile.filename = NULL;
+    }
+
+    if (!failed && stats_requested && !jobs_merge_stats(workers, count)) {
+        cmdarg_err("Can't fold the workers' statistics together: %s",
+                g_strerror(errno));
+        failed = true;
     }
 
     *exit_status = failed ? WS_EXIT_INVALID_FILE : status_from_worker;
@@ -1260,6 +1310,12 @@ fail:
         }
         if (workers[i].names_fd > 0) {
             ws_close(workers[i].names_fd);
+        }
+        if (workers[i].disp_fd > 0) {
+            ws_close(workers[i].disp_fd);
+        }
+        if (workers[i].stats_fd > 0) {
+            ws_close(workers[i].stats_fd);
         }
     }
     g_free(workers);
@@ -2896,6 +2952,15 @@ main(int argc, char *argv[])
                     goto clean_exit;
                 }
                 stats_requested = true;
+                if (stats_unmergeable == NULL &&
+                        strncmp(ws_optarg, "conv,", 5) != 0 &&
+                        strncmp(ws_optarg, "endpoints,", 10) != 0) {
+                    /* A conversation or endpoint table is rows that add
+                     * up, so a sharded run can fold the workers' tables
+                     * together; every other statistic accumulates in a
+                     * shape only that tap knows how to fold. */
+                    stats_unmergeable = ws_optarg;
+                }
                 break;
             case 'd':        /* Decode as rule */
             case 'K':        /* Kerberos keytab file */
@@ -3663,27 +3728,45 @@ main(int argc, char *argv[])
 
 #ifndef _WIN32
     if (jobs > 1) {
-        /* Each worker prints its own packets and the parent puts them back
-         * in order, so there has to be per-packet output to put in order,
-         * and nothing else may be writing to stdout or to a file. */
+        /* Each worker prints its own packets and the parent puts them
+         * back in order, so there has to be something to put in order -
+         * per-packet output, or a statistic the parent can fold - and
+         * nothing else may be writing to stdout or to a file. */
         if (cf_name == NULL) {
             cmdarg_err("--jobs requires a capture file");
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
-        if (!print_packet_info || output_file_name != NULL ||
-                pdu_export_arg != NULL) {
-            cmdarg_err("--jobs only supports printing packets, not -w, "
-                    "--export-pdu or -q");
+        if (output_file_name != NULL || pdu_export_arg != NULL) {
+            cmdarg_err("--jobs only supports printing packets, not -w or "
+                    "--export-pdu");
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
-        if (stats_requested) {
-            /* Folding the accumulators of each tap back together is
+        if (!print_packet_info && !stats_requested) {
+            cmdarg_err("--jobs with -q has nothing to merge unless -z asks "
+                    "for a statistic");
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        if (stats_unmergeable != NULL) {
+            /* A conversation or endpoint table is rows that add up, so
+             * the parent folds the workers' tables together; folding the
+             * accumulators of every other tap back together is
              * tap-specific work that has not been done. Refusing is the
              * only honest option: the numbers would otherwise be wrong. */
-            cmdarg_err("--jobs cannot be used with -z; the statistics would "
-                    "only cover one worker's flows");
+            cmdarg_err("--jobs cannot be used with -z %s; the statistics "
+                    "would only cover one worker's flows", stats_unmergeable);
+            exit_status = WS_EXIT_INVALID_OPTION;
+            goto clean_exit;
+        }
+        if (stats_requested && gbl_resolv_flags.network_name) {
+            /* The parent prints the folded tables, and a name learned
+             * from a DNS response in the capture belongs to the worker
+             * that dissected it. */
+            cmdarg_err("--jobs cannot be used with -z and network name "
+                    "resolution; the names the workers learn from the "
+                    "capture are each worker's own");
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }

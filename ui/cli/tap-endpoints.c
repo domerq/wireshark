@@ -21,12 +21,39 @@
 #include <wsutil/cmdarg_err.h>
 #include <wsutil/str_util.h>
 #include <ui/cli/tshark-tap.h>
+#include <ui/cli/conv-merge.h>
 
 typedef struct _endpoints_t {
 	const char *type;
 	const char *filter;
+	unsigned table;			/* this table's place among the -z tables */
+	tap_packet_cb packet_func;	/* the dissector's, when rows are counted */
 	conv_hash_t hash;
 } endpoints_t;
+
+/*
+ * A worker of a flow-sharded run has to say which frame created each of
+ * its rows: the parent folds the workers' tables together and prints
+ * them in the order the capture as a whole created them, which is the
+ * order rows of the same size come out in.
+ */
+static tap_packet_status
+endpoints_packet(void *arg, packet_info *pinfo, epan_dissect_t *edt,
+	const void *data, tap_flags_t flags)
+{
+	conv_hash_t *hash = (conv_hash_t *)arg;
+	endpoints_t *iu = (endpoints_t *)hash->user_data;
+	unsigned before = hash->conv_array ? hash->conv_array->len : 0;
+	tap_packet_status status;
+	unsigned after;
+
+	status = iu->packet_func(arg, pinfo, edt, data, flags);
+
+	after = hash->conv_array ? hash->conv_array->len : 0;
+	conv_merge_rows_added(iu->table, after - before, pinfo->num);
+
+	return status;
+}
 
 static void
 endpoints_draw(void *arg)
@@ -37,6 +64,11 @@ endpoints_draw(void *arg)
 	uint64_t last_frames, max_frames;
 	unsigned i;
 	bool display_port = (!strncmp(iu->type, "TCP", 3) || !strncmp(iu->type, "UDP", 3) || !strncmp(iu->type, "SCTP", 4)) ? true : false;
+
+	/* A worker hands its rows to the parent rather than printing a
+	 * table that would cover only its own flows. */
+	if (!conv_merge_draw(iu->table))
+		return;
 
 	printf("================================================================================\n");
 	printf("%s Endpoints\n", iu->type);
@@ -135,8 +167,10 @@ void init_endpoints(struct register_ct *ct, const char *filter)
 	iu->type = proto_get_protocol_short_name(find_protocol_by_id(get_conversation_proto_id(ct)));
 	iu->filter = g_strdup(filter);
 	iu->hash.user_data = iu;
+	iu->table = conv_merge_add_table(&iu->hash, true);
+	iu->packet_func = get_endpoint_packet_func(ct);
 
-	error_string = register_tap_listener(proto_get_protocol_filter_name(get_conversation_proto_id(ct)), &iu->hash, filter, 0, NULL, get_endpoint_packet_func(ct), endpoints_draw, endpoints_finish);
+	error_string = register_tap_listener(proto_get_protocol_filter_name(get_conversation_proto_id(ct)), &iu->hash, filter, 0, NULL, conv_merge_needs_frames() ? endpoints_packet : iu->packet_func, endpoints_draw, endpoints_finish);
 	if (error_string) {
 		g_free(iu);
 		cmdarg_err("Couldn't register endpoint tap: %s",

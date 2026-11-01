@@ -20,12 +20,39 @@
 #include <wsutil/str_util.h>
 #include <wsutil/cmdarg_err.h>
 #include <ui/cli/tshark-tap.h>
+#include <ui/cli/conv-merge.h>
 
 typedef struct _io_users_t {
 	const char *type;
 	const char *filter;
+	unsigned table;			/* this table's place among the -z tables */
+	tap_packet_cb packet_func;	/* the dissector's, when rows are counted */
 	conv_hash_t hash;
 } io_users_t;
+
+/*
+ * A worker of a flow-sharded run has to say which frame created each of
+ * its rows: the parent folds the workers' tables together and prints
+ * them in the order the capture as a whole created them, which is the
+ * order rows of the same size come out in.
+ */
+static tap_packet_status
+iousers_packet(void *arg, packet_info *pinfo, epan_dissect_t *edt,
+	const void *data, tap_flags_t flags)
+{
+	conv_hash_t *hash = (conv_hash_t *)arg;
+	io_users_t *iu = (io_users_t *)hash->user_data;
+	unsigned before = hash->conv_array ? hash->conv_array->len : 0;
+	tap_packet_status status;
+	unsigned after;
+
+	status = iu->packet_func(arg, pinfo, edt, data, flags);
+
+	after = hash->conv_array ? hash->conv_array->len : 0;
+	conv_merge_rows_added(iu->table, after - before, pinfo->num);
+
+	return status;
+}
 
 static void
 iousers_draw(void *arg)
@@ -37,6 +64,11 @@ iousers_draw(void *arg)
 	struct tm * tm_time;
 	unsigned i;
 	bool display_ports = (!strncmp(iu->type, "TCP", 3) || !strncmp(iu->type, "UDP", 3) || !strncmp(iu->type, "SCTP", 4)) ? true : false;
+
+	/* A worker hands its rows to the parent rather than printing a
+	 * table that would cover only its own flows. */
+	if (!conv_merge_draw(iu->table))
+		return;
 
 	printf("================================================================================\n");
 	printf("%s Conversations\n", iu->type);
@@ -265,8 +297,10 @@ void init_iousers(struct register_ct *ct, const char *filter)
 	iu->type = proto_get_protocol_short_name(find_protocol_by_id(get_conversation_proto_id(ct)));
 	iu->filter = g_strdup(filter);
 	iu->hash.user_data = iu;
+	iu->table = conv_merge_add_table(&iu->hash, false);
+	iu->packet_func = get_conversation_packet_func(ct);
 
-	error_string = register_tap_listener(proto_get_protocol_filter_name(get_conversation_proto_id(ct)), &iu->hash, filter, 0, NULL, get_conversation_packet_func(ct), iousers_draw, iousers_finish);
+	error_string = register_tap_listener(proto_get_protocol_filter_name(get_conversation_proto_id(ct)), &iu->hash, filter, 0, NULL, conv_merge_needs_frames() ? iousers_packet : iu->packet_func, iousers_draw, iousers_finish);
 	if (error_string) {
 		g_free(iu);
 		cmdarg_err("Couldn't register conversations tap: %s",
