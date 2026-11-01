@@ -40,10 +40,31 @@ class PacketListRecord
 {
 public:
     /**
+     * @brief The tag column data for one packet.
+     *
+     * Only populated when the profile has a COL_TAG column *and* at least
+     * one tagging rule matches the packet, which is why it is allocated
+     * separately: the capture's records are one per packet, so carrying
+     * these four Qt containers inline cost 96 bytes on every packet of
+     * every capture, tags or no tags.
+     */
+    struct TagData {
+        QString column_str;              /**< Concatenated tag_content for all matching rules */
+        QString column_tip;              /**< Tooltip: "name: comment" per matching rule */
+        TagSegmentList column_segments;  /**< (text, url) per matching rule */
+        TagSegmentList link_list;        /**< (rule_name, url) for rules with a URL */
+    };
+
+    /**
      * @brief Constructs a PacketListRecord.
      * @param frameData Pointer to the frame data for this record.
      */
     PacketListRecord(frame_data *frameData);
+
+    /* Records own their TagData (and their color filter list); they are
+     * created with new and only ever referred to by pointer. */
+    PacketListRecord(const PacketListRecord &) = delete;
+    PacketListRecord &operator=(const PacketListRecord &) = delete;
 
     /**
      * @brief Destroys the PacketListRecord.
@@ -99,21 +120,21 @@ public:
     /**
      * @brief Concatenated tag_content strings for all matching rules (for COL_TAG display).
      */
-    const QString &tagColumnString() const { return tag_column_str_; }
+    const QString &tagColumnString() const { return tagData().column_str; }
 
     /**
      * @brief Tooltip text for the tag column (one "name: comment" line per matching rule).
      */
-    const QString &tagColumnTooltip() const { return tag_column_tip_; }
+    const QString &tagColumnTooltip() const { return tagData().column_tip; }
 
     /**
      * @brief Per-segment (text, url) pairs for all matching rules in order.
      *        Used by TagColumnDelegate for per-emoji click-to-URL.
      */
-    const TagSegmentList &tagColumnSegments() const { return tag_column_segments_; }
+    const TagSegmentList &tagColumnSegments() const { return tagData().column_segments; }
 
     /** (rule_name, url) for matching rules that have a URL — used for the right-click Link submenu. */
-    const TagSegmentList &tagLinkList() const { return tag_link_list_; }
+    const TagSegmentList &tagLinkList() const { return tagData().link_list; }
 
     /**
      * @brief Check if packet has multiple color matches
@@ -209,30 +230,31 @@ public:
 private:
     static QCache<uint32_t, QStringList> col_text_cache_; /**< The column text for some columns */
     static bool dissection_paused_; /**< Flag indicating if dissection is globally paused. */
-
-    frame_data *fdata_; /**< Pointer to the underlying frame data. */
-    int lines_; /**< The number of lines the record spans. */
-    bool line_count_changed_; /**< Flag indicating if the line count has changed. */
     static QMap<int, int> cinfo_column_; /**< Mapping from column index to text column index. */
-
     static unsigned int rows_color_ver_; /**< Has this record been colorized? (global version track) */
+    static const TagData empty_tag_data_; /**< Returned by the accessors when tag_data_ is NULL */
+    static bool any_tag_column_; /**< True if any column is COL_TAG */
+
+    /* There is one of these per packet in the capture, so the members are
+     * grouped by size (pointers, then 4-byte values, then flags) to keep the
+     * record free of alignment padding. */
+    frame_data *fdata_; /**< Pointer to the underlying frame data. */
+    GSList *color_filters_; /**< All matching color filters (only if multi-color enabled) */
+    TagData *tag_data_; /**< Tag column data, NULL unless some rule tagged this packet */
+
+    int lines_; /**< The number of lines the record spans. */
     unsigned int color_ver_; /**< The local colorization version for this record. */
-    bool colorized_; /**< Flag indicating if this record has been evaluated for colors. */
-
     unsigned int conv_index_; /**< Conversation. Used by RelatedPacketDelegate */
-
-    bool read_failed_; /**< Flag indicating if reading the frame data failed. */
     int row_; /**< The logical row index in the model. */
     uint32_t expert_severity_; /**< The highest expert information severity flag. */
-
-    GSList *color_filters_; /**< All matching color filters (only if multi-color enabled) */
     int color_filter_count_; /**< The count of matching color filters. */
 
-    QString tag_column_str_; /**< Concatenated tag_content for all matching rules */
-    QString tag_column_tip_; /**< Tooltip: "name: comment" per matching rule */
-    TagSegmentList tag_column_segments_; /**< (text, url) per matching rule */
-    TagSegmentList tag_link_list_;       /**< (rule_name, url) for rules with a URL */
-    static bool any_tag_column_; /**< True if any column is COL_TAG */
+    bool line_count_changed_; /**< Flag indicating if the line count has changed. */
+    bool colorized_; /**< Flag indicating if this record has been evaluated for colors. */
+    bool read_failed_; /**< Flag indicating if reading the frame data failed. */
+
+    /** @brief This record's tag data, or an empty one if it has none. */
+    const TagData &tagData() const { return tag_data_ ? *tag_data_ : empty_tag_data_; }
 
     /**
      * @brief Dissects the packet to evaluate columns and/or coloring.
