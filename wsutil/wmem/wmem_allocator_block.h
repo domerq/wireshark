@@ -52,6 +52,24 @@ wmem_block_allocator_init_backed(wmem_allocator_t *allocator,
         wmem_backing_t *backing);
 
 /**
+ * @brief Take an allocator's future memory from a different store.
+ *
+ * Only possible while the allocator holds no memory at all, since a block
+ * has to be returned to the store it came from. A process that has forked
+ * uses this to stop allocating from a store its siblings are allocating
+ * from as well.
+ *
+ * @param allocator The allocator.
+ * @param backing Backing store to take memory from, or NULL for the heap.
+ * @return false if the allocator is holding memory, in which case nothing
+ *         is changed.
+ */
+WS_DLL_PUBLIC
+bool
+wmem_block_allocator_set_backing(wmem_allocator_t *allocator,
+        wmem_backing_t *backing);
+
+/**
  * @brief Verifies internal consistency of a wmem block allocator.
  *
  * This function performs integrity checks on the internal state of a block-based
