@@ -628,6 +628,24 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
                         g_strerror(errno));
                 exit(WS_EXIT_INIT_FAILED);
             }
+            if (spill_dir != NULL) {
+                char *spill_err;
+
+                /* A store is a set of mappings that one process hands
+                 * out addresses from, so each worker needs its own. The
+                 * watermark is what the run as a whole may keep in RAM,
+                 * so it is divided between them; the reserve is address
+                 * space, which costs nothing until it is used. */
+                capture_backing = wmem_backing_file_new(spill_dir,
+                        spill_reserve, spill_after / count, &spill_err);
+                if (capture_backing == NULL) {
+                    cmdarg_err("Worker %u can't spill to \"%s\": %s", i,
+                            spill_dir, spill_err);
+                    exit(WS_EXIT_INVALID_OPTION);
+                }
+                wmem_set_capture_backing(capture_backing);
+            }
+
             g_free(workers);
             return true;
         }
@@ -637,9 +655,18 @@ jobs_fork(const char *filename, unsigned count, int *exit_status)
     for (i = 0; i < count; i++) {
         int status = 0;
 
-        if (waitpid(workers[i].pid, &status, 0) < 0 ||
-                !WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
-            cmdarg_err("Worker %u failed", i);
+        if (waitpid(workers[i].pid, &status, 0) < 0) {
+            cmdarg_err("Can't wait for worker %u: %s", i, g_strerror(errno));
+            failed = true;
+        }
+        else if (WIFSIGNALED(status)) {
+            cmdarg_err("Worker %u was killed by signal %d", i,
+                    WTERMSIG(status));
+            failed = true;
+        }
+        else if (WEXITSTATUS(status) != EXIT_SUCCESS) {
+            cmdarg_err("Worker %u exited with status %d", i,
+                    WEXITSTATUS(status));
             failed = true;
         }
     }
@@ -1781,7 +1808,7 @@ main(int argc, char *argv[])
     application_file_extensions(&file_extensions, &num_extensions);
     wtap_init(true, application_configuration_environment_prefix(), file_extensions, num_extensions);
 
-    if (spill_dir != NULL) {
+    if (spill_dir != NULL && jobs <= 1) {
         char *spill_err;
 
         capture_backing = wmem_backing_file_new(spill_dir, spill_reserve,
@@ -1793,7 +1820,10 @@ main(int argc, char *argv[])
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
-        /* Must happen before epan_init() creates the scopes. */
+        /* Must happen before epan_init() creates the scopes. With --jobs
+         * the store is created in each worker instead, because a mapping
+         * that two processes allocate from independently is not a store
+         * they can share. */
         wmem_set_capture_backing(capture_backing);
     }
 

@@ -13,6 +13,7 @@
 
 #include "wmem_scopes.h"
 
+#include <wsutil/wmem/wmem_allocator_block.h>
 #include <wsutil/ws_assert.h>
 
 /* One of the supposed benefits of wmem over the old emem was going to be that
@@ -78,9 +79,22 @@ wmem_leave_file_scope(void)
 void
 wmem_set_capture_backing(wmem_backing_t *backing)
 {
-    ws_assert(file_scope == NULL);
-
     capture_backing = backing;
+
+    if (file_scope != NULL) {
+        /* The scopes are already up, so this is a process that forked
+         * after epan_init() and wants a store of its own rather than one
+         * shared with its siblings: two processes handing out addresses
+         * from the same mapping would hand out the same addresses. This
+         * only works before a capture file has been read, while file
+         * scope is still holding nothing. */
+        ws_assert(!wmem_in_scope(file_scope));
+
+        if (!wmem_block_allocator_set_backing(file_scope, backing)) {
+            ws_error("wmem: the capture backing store cannot be changed "
+                    "once file scope holds memory");
+        }
+    }
 }
 
 wmem_backing_t *

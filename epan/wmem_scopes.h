@@ -61,11 +61,17 @@ wmem_leave_file_scope(void);
 /**
  * @brief Make capture-lifetime state live in a backing store.
  *
- * Must be called before wmem_init_scopes(), i.e. before epan_init(). The
- * file scope, which owns conversations, reassembly state, per-packet proto
+ * Called before wmem_init_scopes(), i.e. before epan_init(), the file
+ * scope - which owns conversations, reassembly state, per-packet proto
  * data and everything else that has to survive until the capture file is
- * closed, is then served out of the given store instead of the heap. The
- * caller owns the store and must keep it alive until after
+ * closed - is served out of the given store instead of out of the heap.
+ *
+ * It may also be called after a process has forked, as long as no capture
+ * file has been opened yet, which replaces the file scope allocator so
+ * that the new process allocates from its own store rather than from one
+ * its siblings are also allocating from.
+ *
+ * The caller owns the store and must keep it alive until after
  * wmem_cleanup_scopes().
  *
  * @param backing The backing store, or NULL to use the heap.

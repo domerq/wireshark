@@ -231,6 +231,17 @@ class TestTsharkJobs:
             assert process.returncode == ExitCodes.COMMAND_LINE, \
                     'tshark --jobs accepted ' + ' '.join(extra)
 
+    def test_tshark_jobs_spill_per_worker(self, cmd_tshark, capture_file, test_env, tmp_path):
+        '''Each worker spills to a store of its own, with the same output'''
+        serial = self.summary(cmd_tshark, capture_file, test_env)
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('dns-mdns.pcap'), '--jobs', '2',
+            '--spill-dir', str(tmp_path), '--spill-after', '0',
+        ), capture_output=True, env=test_env)
+        assert process.returncode == 0
+        assert process.stdout == serial
+        assert count_output(process.stderr, 'dissection state') == 2
+
     def test_tshark_jobs_rejects_zero(self, cmd_tshark, capture_file, test_env):
         process = subprocesstest.run((cmd_tshark,
             '-r', capture_file('http.pcap'), '--jobs', '0',

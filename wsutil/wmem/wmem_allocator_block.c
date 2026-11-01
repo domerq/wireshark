@@ -1151,6 +1151,24 @@ wmem_block_allocator_init_backed(wmem_allocator_t *allocator,
     block_allocator->backing       = backing;
 }
 
+bool
+wmem_block_allocator_set_backing(wmem_allocator_t *allocator,
+                                 wmem_backing_t *backing)
+{
+    wmem_block_allocator_t *block_allocator =
+        (wmem_block_allocator_t *)allocator->private_data;
+
+    /* Blocks are freed back to wherever they came from, so an allocator
+     * that is holding any cannot be pointed somewhere else. */
+    if (block_allocator->block_list != NULL) {
+        return false;
+    }
+
+    block_allocator->backing = backing;
+
+    return true;
+}
+
 void
 wmem_block_allocator_init(wmem_allocator_t *allocator)
 {

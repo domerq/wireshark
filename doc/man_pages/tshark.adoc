@@ -2530,6 +2530,13 @@ would not be the result of a single-process run: conversation index fields
 such as __tcp.stream__ are numbered per worker, statistics would cover one
 worker's flows, and a worker cannot tell whether a packet it did not
 dissect would have passed a filter.
+
+With *--spill-dir*, each worker gets a store of its own, since a mapping
+that two processes allocate from independently is not a store they can
+share, and *--spill-after* is divided between them: it is what the run as
+a whole may keep in RAM. Sharding and spilling work well together,
+because each worker's state is a fraction of the whole and so is the part
+of it that is touched at random.
 --
 
 // Add a "capture-options" group for the common capture options?
