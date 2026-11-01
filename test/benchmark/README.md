@@ -7,13 +7,14 @@ suite; the captures are large and the runs take minutes.
 ## gen_pcap.py
 
 Synthetic TCP captures with an exact packet and flow count, which is what
-separates per-packet cost from per-flow cost:
+separates per-packet cost from per-flow cost, and what the two synthetic
+rows in `doc/README.memory-spill` section 7 come from:
 
-    ./gen_pcap.py -c 1000000 -f 500   /tmp/few_flows.pcap
-    ./gen_pcap.py -c 1000000 -f 500000 /tmp/many_flows.pcap
+    ./gen_pcap.py -c 2000000 -f 50000  /tmp/few.pcap
+    ./gen_pcap.py -c 1000000 -f 500000 /tmp/many.pcap
 
-Same packet count, 1000x the flows. The difference in peak memory divided by
-the difference in flow count is the per-conversation cost (~4 KB for TCP).
+The difference in peak memory divided by the difference in flow count is the
+per-conversation cost (~4 KB for TCP).
 
 `-s N` writes N capture files instead of one, partitioned so that each holds
 whole flows. That is the input a flow-sharded parallel dissection would give
@@ -22,7 +23,8 @@ each worker.
 ## flow_split.py
 
 The same partitioning for a capture you already have, which is how the
-four-worker numbers in `doc/README.memory-spill` section 7 were produced:
+four-worker numbers in `doc/README.memory-spill` section 7 were produced
+before `--jobs` existed:
 
     ./flow_split.py big.pcap /tmp/shard -n 4
     # 9530000 packets, 412390 address pairs
@@ -95,27 +97,46 @@ It uses dyld interposition, so it is macOS only:
 allocator with `dlsym(RTLD_NEXT, ...)`; it is not included here. A cgroup
 memory limit achieves the same thing without any shim.)
 
-Run with no budget to report peak heap:
+Run with no budget to report peak heap. The real capture used in
+`doc/README.memory-spill` sections 7 and 9 is five days of the 2015-03
+traffic merged into one file (1589 MB, 2033 k packets):
 
-    DYLD_INSERT_LIBRARIES=./memcap.dylib \
-        tshark -r big.pcap -q -z conv,tcp >/dev/null
-    # memcap: peak heap 9080 MB, live at exit 0 MB
+    build/run/mergecap -w /tmp/big.pcap 2015-03-0[5-9]/*
 
-Run with a budget to force the failure:
+    DYLD_INSERT_LIBRARIES=/tmp/memcap.dylib \
+        build/run/tshark -r /tmp/big.pcap -q -z conv,tcp > /tmp/ref.out
+    # memcap: peak heap 2773 MB, live at exit 0 MB
 
-    export DYLD_INSERT_LIBRARIES=./memcap.dylib
-    export MEMCAP_BYTES=$((512 * 1024 * 1024))
+The watermark table is the same run with a spill directory:
 
-    tshark -r big.pcap -q -z conv,tcp > heap.out
-    # GLib ERROR: failed to allocate 8388608 bytes - Aborting
+    DYLD_INSERT_LIBRARIES=/tmp/memcap.dylib \
+        build/run/tshark -r /tmp/big.pcap --spill-dir /tmp/spill \
+            --spill-after 1024 -q -z conv,tcp > /tmp/wm1024.out
+    # dissection state: 1016 MB peak in RAM, 1687 MB peak spilled
+    # memcap: peak heap 1083 MB, live at exit 0 MB
+    cmp /tmp/ref.out /tmp/wm1024.out
 
-    tshark -r big.pcap --spill-dir /tmp --spill-after 0 -q -z conv,tcp > spill.out
-    # memcap: peak heap 141 MB
-    cmp heap-unconstrained.out spill.out
+Run with a budget below the state size to force the failure:
+
+    export DYLD_INSERT_LIBRARIES=/tmp/memcap.dylib
+    export MEMCAP_BYTES=$((1024 * 1024 * 1024))
+
+    build/run/tshark -r /tmp/big.pcap -q -z conv,tcp > /tmp/oom1.out
+    # GLib ERROR: failed to allocate 8388608 bytes - Aborting (2.8 s, no output)
+
+    build/run/tshark -r /tmp/big.pcap --spill-dir /tmp/spill \
+        -q -z conv,tcp > /tmp/oom2.out
+    # same abort: the default 2048 MB watermark is above the 1024 MB budget
+
+    build/run/tshark -r /tmp/big.pcap --spill-dir /tmp/spill \
+        --spill-after 512 -q -z conv,tcp > /tmp/oom3.out
+    # dissection state: 507 MB peak in RAM, 2196 MB peak spilled
+    # memcap: peak heap 575 MB, live at exit 0 MB
+    cmp /tmp/ref.out /tmp/oom3.out
 
 Note that the interposer is stripped from the environment for setuid or
-system binaries, so run the built `tshark` directly rather than through
-`/usr/bin/time`.
+system binaries, so run the built `tshark` directly and time it with the
+shell's `time` rather than through `/usr/bin/time`, which loses it.
 
 ## Measuring a real capture
 
