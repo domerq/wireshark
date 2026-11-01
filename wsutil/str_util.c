@@ -694,6 +694,42 @@ format_size_wmem(wmem_allocator_t *allocator, int64_t size,
     return g_strchomp(ret_val);
 }
 
+bool
+ws_parse_size(const char *str, uint64_t default_unit, uint64_t *size)
+{
+    const char *end;
+    uint64_t    value;
+    uint64_t    unit = default_unit;
+
+    if (!ws_basestrtou64(str, &end, &value, 10)) {
+        return false;
+    }
+
+    switch (g_ascii_toupper(*end)) {
+        case '\0': break;
+        case 'K':  unit = UINT64_C(1024); end++; break;
+        case 'M':  unit = UINT64_C(1024) * 1024; end++; break;
+        case 'G':  unit = UINT64_C(1024) * 1024 * 1024; end++; break;
+        case 'T':  unit = UINT64_C(1024) * 1024 * 1024 * 1024; end++; break;
+        default:   return false;
+    }
+
+    /* "2GB" and "2G" are the same thing. */
+    if (g_ascii_toupper(*end) == 'B') {
+        end++;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+
+    if (unit != 0 && value > UINT64_MAX / unit) {
+        return false;
+    }
+    *size = value * unit;
+
+    return true;
+}
+
 char
 printable_char_or_period(char c)
 {
