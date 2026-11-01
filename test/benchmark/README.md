@@ -35,6 +35,11 @@ longest-processing-time-first from a counting pass. Hashing the key instead
 left the busiest shard 24% above ideal at 4 ways and 72% at 16; this stays
 within 1% up to 16. Input must be pcap, not pcapng.
 
+`tshark --shard-plan N` now computes the same division without writing
+anything, and `tshark --jobs N` runs it; this script remains useful for
+producing the separate files that measurements predating `--jobs` used,
+and for feeding tools other than TShark.
+
 ## Dockerfile
 
 The Linux side. Builds a tshark with the same options used for the
