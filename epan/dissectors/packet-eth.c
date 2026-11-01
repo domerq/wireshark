@@ -382,7 +382,11 @@ init_eth_conversation_data(packet_info *pinfo)
     ethd=wmem_new0(wmem_file_scope(), struct eth_analysis);
 
     ethd->initial_frame = pinfo->num;
-    ethd->stream = ordinal_next(&eth_stream_ordinal, pinfo->num);
+    /* Processes dissecting different flows of one capture can each meet
+     * the same pair of hardware addresses, and they all have to number
+     * it the same way. */
+    ethd->stream = ordinal_next_for(&eth_stream_ordinal, pinfo->num,
+            ordinal_identity(&pinfo->dl_src, 0, &pinfo->dl_dst, 0));
 
     return ethd;
 }
