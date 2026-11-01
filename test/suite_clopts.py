@@ -235,6 +235,40 @@ class TestTsharkShardPlan:
         assert process.returncode == ExitCodes.COMMAND_LINE
 
 
+@pytest.mark.skipif(sys.platform.startswith('win32'), reason='--jobs needs fork()')
+class TestTsharkJobs:
+    @staticmethod
+    def summary(cmd_tshark, capture_file, test_env, *extra):
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('dns-mdns.pcap')) + extra,
+            capture_output=True, env=test_env)
+        assert process.returncode == 0
+        return process.stdout
+
+    def test_tshark_jobs_output_matches_one_process(self, cmd_tshark, capture_file, test_env):
+        '''Sharded output is the output a single process would print'''
+        serial = self.summary(cmd_tshark, capture_file, test_env)
+        for workers in ('2', '4', '16'):
+            assert self.summary(cmd_tshark, capture_file, test_env,
+                    '--jobs', workers) == serial
+
+    def test_tshark_jobs_refuses_what_it_cannot_merge(self, cmd_tshark, capture_file, test_env):
+        '''Options whose results would differ are refused, not approximated'''
+        for extra in (('-V',), ('-T', 'pdml'), ('-T', 'json'), ('-q', '-z', 'conv,ip'),
+                      ('-Y', 'ip'), ('-2',)):
+            process = subprocesstest.run((cmd_tshark,
+                '-r', capture_file('dns-mdns.pcap'), '--jobs', '2') + extra,
+                capture_output=True, env=test_env)
+            assert process.returncode == ExitCodes.COMMAND_LINE, \
+                    'tshark --jobs accepted ' + ' '.join(extra)
+
+    def test_tshark_jobs_rejects_zero(self, cmd_tshark, capture_file, test_env):
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('http.pcap'), '--jobs', '0',
+        ), capture_output=True, env=test_env)
+        assert process.returncode == ExitCodes.COMMAND_LINE
+
+
 class TestTsharkNameResolutionClopts:
     def test_tshark_valid_name_resolution(self, cmd_tshark, capture_file, test_env):
         # $TSHARK -N mnNtdv -a duration:1 > ./testout.txt 2>&1
