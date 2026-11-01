@@ -813,35 +813,64 @@ jobs_read_ordinals(jobs_worker_t *worker, GHashTable *names,
     return true;
 }
 
-/* The value for one request: the same as the last time this identity was
- * numbered, if it has been, since several workers can be numbering the
- * same thing - a conversation between two MAC addresses is not confined
- * to one flow, and each worker that sees it creates its own. */
+/* The value for one request.
+ *
+ * Several workers can be numbering the same thing: a conversation
+ * between two MAC addresses is not confined to one flow, and the inner
+ * header of an ICMP error names a flow that belongs to someone else, so
+ * whichever worker meets it creates state for it. Those have to come out
+ * as one number, which is what the identity is for.
+ *
+ * One worker asking twice for the same identity is the opposite case: a
+ * capture where a port pair is used, closed and used again has two
+ * conversations, and a single process numbers them separately. A flow
+ * and its reuse are the same addresses, so they are always the same
+ * worker's; "same identity, same worker" is therefore the case that
+ * means a new number, and it becomes the one a later worker folds on. */
+typedef struct {
+    uint32_t value;
+    unsigned worker;
+} jobs_ordinal_shared_t;
+
 static uint32_t
 jobs_ordinal_value(GHashTable *shared, unsigned id, uint64_t identity,
-        GArray *next_value)
+        unsigned worker, GArray *next_value)
 {
-    uint64_t key;
-    void    *found;
-    uint32_t value;
+    jobs_ordinal_shared_t *entry = NULL;
+    uint64_t               key = 0;
+    void                  *found;
 
     if (identity != 0) {
         key = identity ^ ((uint64_t)id << 56);
         if (g_hash_table_lookup_extended(shared, &key, NULL, &found)) {
-            return GPOINTER_TO_UINT(found);
+            entry = (jobs_ordinal_shared_t *)found;
+            if (entry->worker != worker) {
+                return entry->value;
+            }
         }
     }
 
-    value = g_array_index(next_value, uint32_t, id)++;
-
-    if (identity != 0) {
-        uint64_t *stored = g_new(uint64_t, 1);
-
-        *stored = key;
-        g_hash_table_insert(shared, stored, GUINT_TO_POINTER(value));
+    if (entry != NULL) {
+        entry->value = g_array_index(next_value, uint32_t, id)++;
+        return entry->value;
     }
 
-    return value;
+    if (identity == 0) {
+        return g_array_index(next_value, uint32_t, id)++;
+    }
+
+    {
+        uint64_t *stored = g_new(uint64_t, 1);
+
+        entry = g_new(jobs_ordinal_shared_t, 1);
+        entry->value  = g_array_index(next_value, uint32_t, id)++;
+        entry->worker = worker;
+
+        *stored = key;
+        g_hash_table_insert(shared, stored, entry);
+
+        return entry->value;
+    }
 }
 
 
@@ -868,7 +897,7 @@ jobs_merge_ordinals(jobs_worker_t *workers, unsigned count)
 
     names      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     shared     = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
-            NULL);
+            g_free);
     name_list  = g_ptr_array_new_with_free_func(g_free);
     events     = g_new0(GArray *, count);
     ids        = g_new0(GArray *, count);
@@ -915,7 +944,7 @@ jobs_merge_ordinals(jobs_worker_t *workers, unsigned count)
         rec.identity = 0;
         rec.value    = jobs_ordinal_value(shared, id,
                 g_array_index(identities[best], uint64_t, cursor[best]),
-                next_value);
+                best, next_value);
         g_array_append_val(out[best], rec);
         cursor[best]++;
     }
