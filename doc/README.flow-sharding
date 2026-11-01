@@ -122,8 +122,14 @@ accepted. The rest are refused rather than approximated:
                         be measured from the wrong one.
     -w, --export-pdu    There would be nothing to merge in frame order.
     -q                  Likewise.
-    -2                  Not implemented.
     Windows             No fork().
+
+Two-pass analysis (-2) is supported. Each worker indexes every packet,
+so that the frame numbering and the frames the second pass walks are the
+capture's, but dissects only its own; the frames it does not own still
+advance what later packets are printed relative to. The reference frame
+is deliberately left for the second pass to find, since the first one
+only saw this worker's packets.
 
 7. What it cannot refuse
 ------------------------

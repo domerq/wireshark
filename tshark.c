@@ -506,6 +506,40 @@ jobs_ordinal_replay(const char *name, int *id _U_, uint32_t frame,
     return rec.value;
 }
 
+/* Which frames this worker owns, by frame number, worked out on the pass
+ * that reads the file so that a later pass does not have to read other
+ * workers' packets at all. */
+static GArray *jobs_owned;
+
+static void
+jobs_set_owned(uint32_t framenum, bool owned)
+{
+    if (jobs_owned == NULL) {
+        jobs_owned = g_array_new(FALSE, TRUE, sizeof(uint8_t));
+    }
+    if (framenum >= jobs_owned->len) {
+        g_array_set_size(jobs_owned, framenum + 1);
+    }
+    g_array_index(jobs_owned, uint8_t, framenum) = owned ? 1 : 0;
+}
+
+static bool
+jobs_owns(uint32_t framenum)
+{
+    return jobs_owned != NULL && framenum < jobs_owned->len &&
+        g_array_index(jobs_owned, uint8_t, framenum) != 0;
+}
+
+/* Does this packet belong to this worker? */
+static bool
+jobs_owns_record(const wtap_rec *rec)
+{
+    return flow_shard_plan_shard_of(jobs_plan,
+            rec->rec_header.packet_header.pkt_encap,
+            ws_buffer_start_ptr(&rec->data),
+            rec->rec_header.packet_header.caplen) == jobs_shard;
+}
+
 /* An unlinked temporary file: the workers inherit the descriptor, the
  * parent reads it back, and nothing has to clean up after a crash. */
 static int
@@ -3539,11 +3573,6 @@ main(int argc, char *argv[])
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
-        if (perform_two_pass_analysis) {
-            cmdarg_err("--jobs cannot be used with -2");
-            exit_status = WS_EXIT_INVALID_OPTION;
-            goto clean_exit;
-        }
 
         /* A flow that is set up by signalling carried on a different
          * flow - RTP announced in SDP is the usual case - is dissected
@@ -4706,6 +4735,22 @@ process_cap_file_first_pass(capture_file *cf, int max_packet_count,
         }
         framenum++;
 
+#ifndef _WIN32
+        /* Every packet is indexed, so that the frame numbering and the
+         * frames the second pass walks are the capture's, but only this
+         * worker's packets are dissected. */
+        if (jobs_plan != NULL) {
+            bool ours = jobs_owns_record(&rec);
+
+            jobs_set_owned((uint32_t)framenum, ours);
+            if (!ours) {
+                process_packet_first_pass(cf, NULL, data_offset, &rec);
+                wtap_rec_reset(&rec);
+                continue;
+            }
+        }
+#endif
+
         if (process_packet_first_pass(cf, edt, data_offset, &rec)) {
             /* Stop reading if we hit a stop condition */
             if (max_packet_count > 0 && framenum >= max_packet_count) {
@@ -4733,6 +4778,16 @@ process_cap_file_first_pass(capture_file *cf, int max_packet_count,
     /* Allow the protocol dissectors to free up memory that they
      * don't need after the sequential run-through of the packets. */
     postseq_cleanup_all_protocols();
+
+#ifndef _WIN32
+    if (jobs_plan != NULL) {
+        /* This pass only dissected the packets this worker owns, so the
+         * reference frame it settled on is this worker's first packet
+         * rather than the capture's. The pass that prints walks every
+         * frame, so let it find the right one. */
+        cf->provider.ref = NULL;
+    }
+#endif
 
     cf->provider.prev_dis = NULL;
     cf->provider.prev_cap = NULL;
@@ -4888,6 +4943,7 @@ process_cap_file_second_pass(capture_file *cf, wtap_dumper *pdh,
     bool            filtering_tap_listeners;
     unsigned        tap_flags;
     epan_dissect_t *edt = NULL;
+    int64_t         packet_start = 0;
     pass_status_t   status = PASS_SUCCEEDED;
 
     /*
@@ -4953,6 +5009,25 @@ process_cap_file_second_pass(capture_file *cf, wtap_dumper *pdh,
             break;
         }
         fdata = frame_data_sequence_find(cf->provider.frames, framenum);
+
+#ifndef _WIN32
+        if (jobs_plan != NULL && !jobs_owns((uint32_t)framenum)) {
+            /* Another worker prints this one. Keep what later packets
+             * are printed relative to up to date and move on without
+             * even reading it. */
+            frame_data_set_before_dissect(fdata, &cf->elapsed_time,
+                    &cf->provider.ref, cf->provider.prev_dis);
+            if (cf->provider.ref == fdata) {
+                ref_frame = *fdata;
+                cf->provider.ref = &ref_frame;
+            }
+            frame_data_set_after_dissect(fdata, &cum_bytes);
+            cf->provider.prev_dis = fdata;
+            cf->provider.prev_cap = fdata;
+            continue;
+        }
+#endif
+
         if (!wtap_seek_read(cf->provider.wth, fdata->file_off, &rec, err,
                     err_info)) {
             /* Error reading from the input file. */
@@ -4960,6 +5035,13 @@ process_cap_file_second_pass(capture_file *cf, wtap_dumper *pdh,
             break;
         }
         ws_debug("tshark: invoking process_packet_second_pass() for frame #%d", framenum);
+
+#ifndef _WIN32
+        if (jobs_plan != NULL && jobs_pass == 2) {
+            packet_start = ws_ftell64(stdout);
+        }
+#endif
+
         switch (process_packet_second_pass(cf, edt, fdata, &rec, tap_flags)) {
 
         case PROCESS_PACKET_PASSED:
@@ -5002,6 +5084,12 @@ process_cap_file_second_pass(capture_file *cf, wtap_dumper *pdh,
             status = PASS_PRINT_ERROR;
             break;
         }
+
+#ifndef _WIN32
+        if (jobs_plan != NULL && jobs_pass == 2) {
+            jobs_record_packet((uint32_t)framenum, packet_start);
+        }
+#endif
     }
 
     if (edt)
