@@ -218,7 +218,9 @@ class TestTsharkJobs:
         '''Sharded output is the output a single process would print'''
         for extra in ((), ('-V', '-x'), ('-T', 'fields', '-e', 'frame.number',
                                          '-e', 'ip.stream', '-e', 'udp.stream'),
-                      ('-T', 'ek'), ('-2',), ('-2', '-V')):
+                      ('-T', 'ek'), ('-2',), ('-2', '-V'),
+                      ('-Y', 'frame.number % 3 == 0'),
+                      ('-Y', 'udp', '-V')):
             serial = self.summary(cmd_tshark, capture_file, test_env, *extra)
             for workers in ('2', '4', '16'):
                 assert self.summary(cmd_tshark, capture_file, test_env,
@@ -228,7 +230,8 @@ class TestTsharkJobs:
 
     def test_tshark_jobs_refuses_what_it_cannot_merge(self, cmd_tshark, capture_file, test_env):
         '''Options whose results would differ are refused, not approximated'''
-        for extra in (('-T', 'json'), ('-q', '-z', 'conv,ip'), ('-Y', 'ip')):
+        for extra in (('-T', 'json'), ('-q', '-z', 'conv,ip'),
+                      ('-R', 'udp'),):
             process = subprocesstest.run((cmd_tshark,
                 '-r', capture_file('dns-mdns.pcap'), '--jobs', '2') + extra,
                 capture_output=True, env=test_env)

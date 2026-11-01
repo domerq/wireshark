@@ -438,6 +438,7 @@ typedef struct {
     int   idx_fd;
     int   ord_fd;               /* ordinals: recorded, then handed back */
     int   names_fd;             /* counter id -> counter name */
+    int   disp_fd;              /* frames that passed the display filter */
     FILE *idx_fp;               /* parent side, for reading back */
     jobs_index_entry_t entry;
     bool  have_entry;
@@ -582,6 +583,53 @@ jobs_record_packet(uint32_t framenum, int64_t start)
     }
 }
 
+/* With a display filter, which frames passed it. A worker only knows
+ * about its own, so the first pass collects the verdicts, the parent
+ * merges them and every worker gets the whole capture's back: without
+ * that, "delta from previous displayed" would be measured from the
+ * previous packet this worker displayed. */
+static GArray *jobs_displayed;
+static FILE   *jobs_displayed_fp;
+
+/* Pass one: this frame passed the display filter. */
+static void
+jobs_record_displayed(uint32_t framenum)
+{
+    if (jobs_displayed_fp == NULL) {
+        return;
+    }
+    if (fwrite(&framenum, sizeof(framenum), 1, jobs_displayed_fp) != 1) {
+        cmdarg_err("Can't record a display filter verdict: %s",
+                g_strerror(errno));
+        exit(WS_EXIT_INVALID_FILE);
+    }
+}
+
+static void
+jobs_set_displayed(uint32_t framenum)
+{
+    if (jobs_displayed == NULL) {
+        jobs_displayed = g_array_new(FALSE, TRUE, sizeof(uint8_t));
+    }
+    if (framenum >= jobs_displayed->len) {
+        g_array_set_size(jobs_displayed, framenum + 1);
+    }
+    g_array_index(jobs_displayed, uint8_t, framenum) = 1;
+}
+
+/* Whether a frame this worker did not dissect was displayed. Without a
+ * display filter every frame is. */
+static bool
+jobs_was_displayed(uint32_t framenum)
+{
+    if (jobs_displayed == NULL) {
+        return true;
+    }
+
+    return framenum < jobs_displayed->len &&
+        g_array_index(jobs_displayed, uint8_t, framenum) != 0;
+}
+
 /* A packet another worker owns still contributes to the state that later
  * packets are printed relative to: the frame numbering, the time
  * reference, the previous frame and the cumulative byte count. Keep that
@@ -603,12 +651,10 @@ jobs_skip_packet(capture_file *cf, wtap_rec *rec, int64_t offset)
     }
     frame_data_set_after_dissect(&fdata, &cum_bytes);
 
-    /* Without a display filter every packet is displayed, so this is also
-     * the frame that "delta from previous displayed" is measured against.
-     * A worker cannot know whether a packet it never dissected would have
-     * passed a filter, which is why -Y and those columns do not mix. */
-    prev_dis_frame = fdata;
-    cf->provider.prev_dis = &prev_dis_frame;
+    if (jobs_was_displayed(cf->count)) {
+        prev_dis_frame = fdata;
+        cf->provider.prev_dis = &prev_dis_frame;
+    }
     prev_cap_frame = fdata;
     cf->provider.prev_cap = &prev_cap_frame;
 
@@ -909,6 +955,59 @@ out:
     return ok;
 }
 
+/*
+ * Collect the display filter verdicts of every worker and give the whole
+ * capture's set back to each of them: a worker needs to know which
+ * frames anyone displayed, not just which of its own it displayed.
+ */
+static bool
+jobs_merge_displayed(jobs_worker_t *workers, unsigned count)
+{
+    GArray  *frames = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    unsigned i;
+    bool     ok = true;
+
+    for (i = 0; i < count; i++) {
+        struct stat st;
+        uint32_t   *buf;
+
+        if (fstat(workers[i].disp_fd, &st) != 0) {
+            ok = false;
+            goto out;
+        }
+        if (st.st_size == 0) {
+            continue;
+        }
+        buf = (uint32_t *)g_malloc((size_t)st.st_size);
+        if (pread(workers[i].disp_fd, buf, (size_t)st.st_size, 0) !=
+                (ssize_t)st.st_size) {
+            g_free(buf);
+            ok = false;
+            goto out;
+        }
+        g_array_append_vals(frames, buf,
+                (unsigned)((size_t)st.st_size / sizeof(uint32_t)));
+        g_free(buf);
+    }
+
+    for (i = 0; i < count; i++) {
+        ssize_t want = (ssize_t)(frames->len * sizeof(uint32_t));
+
+        if (ftruncate(workers[i].disp_fd, 0) != 0 ||
+                lseek(workers[i].disp_fd, 0, SEEK_SET) == (off_t)-1 ||
+                write(workers[i].disp_fd, frames->data, (size_t)want) !=
+                want) {
+            ok = false;
+            goto out;
+        }
+    }
+
+out:
+    g_array_free(frames, TRUE);
+
+    return ok;
+}
+
 /* Worker side of starting a pass: take over the spools. */
 static void
 jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
@@ -918,13 +1017,16 @@ jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
     jobs_pass  = pass;
 
     if (pass == 1) {
-        /* Nothing is printed in this pass; it exists to find out which
-         * ordinals the capture creates and in what order. */
+        /* Nothing is printed in this pass; it is there to find out what
+         * the capture as a whole would have numbered, and which frames a
+         * display filter lets through. */
         jobs_ordinal_names = g_ptr_array_new();
         jobs_ordinal_local = g_array_new(FALSE, FALSE, sizeof(uint32_t));
         jobs_ordinal_fp    = fdopen(worker->ord_fd, "wb");
         jobs_names_fp      = fdopen(worker->names_fd, "wb");
-        if (jobs_ordinal_fp == NULL || jobs_names_fp == NULL) {
+        jobs_displayed_fp  = fdopen(worker->disp_fd, "wb");
+        if (jobs_ordinal_fp == NULL || jobs_names_fp == NULL ||
+                jobs_displayed_fp == NULL) {
             cmdarg_err("Worker %u can't use its spool: %s", shard,
                     g_strerror(errno));
             exit(WS_EXIT_INIT_FAILED);
@@ -950,6 +1052,28 @@ jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
                 exit(WS_EXIT_INIT_FAILED);
             }
             ordinal_set_provider(jobs_ordinal_replay, NULL);
+        }
+
+        if (fstat(worker->disp_fd, &st) == 0 && st.st_size > 0) {
+            uint32_t *frames = (uint32_t *)g_malloc((size_t)st.st_size);
+            size_t    n      = (size_t)st.st_size / sizeof(uint32_t);
+            size_t    j;
+
+            if (pread(worker->disp_fd, frames, (size_t)st.st_size, 0) !=
+                    (ssize_t)st.st_size) {
+                cmdarg_err("Worker %u can't read the display filter "
+                        "verdicts: %s", shard, g_strerror(errno));
+                exit(WS_EXIT_INIT_FAILED);
+            }
+            for (j = 0; j < n; j++) {
+                jobs_set_displayed(frames[j]);
+            }
+            if (jobs_displayed == NULL) {
+                /* Nothing passed anywhere; say so rather than treating
+                 * an empty list as "no filter". */
+                jobs_displayed = g_array_new(FALSE, TRUE, sizeof(uint8_t));
+            }
+            g_free(frames);
         }
 
         jobs_index_fp = fdopen(worker->idx_fd, "wb");
@@ -1041,7 +1165,7 @@ jobs_run_pass(jobs_worker_t *workers, unsigned count, unsigned pass,
  * has been written out, with the exit status in *exit_status.
  */
 static bool
-jobs_fork(const char *filename, unsigned count, bool need_ordinals,
+jobs_fork(const char *filename, unsigned count, bool need_first_pass,
         int *exit_status)
 {
     jobs_worker_t *workers;
@@ -1065,8 +1189,10 @@ jobs_fork(const char *filename, unsigned count, bool need_ordinals,
         workers[i].idx_fd   = jobs_spool_open();
         workers[i].ord_fd   = jobs_spool_open();
         workers[i].names_fd = jobs_spool_open();
+        workers[i].disp_fd  = jobs_spool_open();
         if (workers[i].out_fd < 0 || workers[i].idx_fd < 0 ||
-                workers[i].ord_fd < 0 || workers[i].names_fd < 0) {
+                workers[i].ord_fd < 0 || workers[i].names_fd < 0 ||
+                workers[i].disp_fd < 0) {
             cmdarg_err("Can't create a spool file for worker %u: %s", i,
                     g_strerror(errno));
             *exit_status = WS_EXIT_INVALID_FILE;
@@ -1074,17 +1200,23 @@ jobs_fork(const char *filename, unsigned count, bool need_ordinals,
         }
     }
 
-    /* Output that carries an ordinal - packet details, or any of the
-     * structured formats - needs a pass to find out what the capture as
-     * a whole would have numbered them. Summary columns do not carry
-     * any, so that pass is skipped. */
-    if (need_ordinals) {
+    /* A first pass is needed when the output carries an ordinal - packet
+     * details, or any of the structured formats - so that the numbering
+     * is the whole capture's, and when there is a display filter, so
+     * that every worker knows which frames anyone displayed. Summary
+     * output with no filter needs neither. */
+    if (need_first_pass) {
         if (jobs_run_pass(workers, count, 1, &status_from_worker, &failed)) {
             g_free(workers);
             return true;
         }
         if (!failed && !jobs_merge_ordinals(workers, count)) {
             cmdarg_err("Can't work out the conversation numbering: %s",
+                    g_strerror(errno));
+            failed = true;
+        }
+        if (!failed && !jobs_merge_displayed(workers, count)) {
+            cmdarg_err("Can't collect the display filter verdicts: %s",
                     g_strerror(errno));
             failed = true;
         }
@@ -3563,13 +3695,10 @@ main(int argc, char *argv[])
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
-        if (rfcode != NULL || dfcode != NULL) {
-            /* A worker does not dissect the packets it does not own, so
-             * it cannot know whether they would have passed a filter, and
-             * columns measured from the previous displayed packet would
-             * be measured from the wrong one. */
-            cmdarg_err("--jobs cannot be used with a read or display "
-                    "filter");
+        if (rfcode != NULL) {
+            /* A read filter drops packets before they are numbered, so
+             * the frame numbers would be each worker's own. */
+            cmdarg_err("--jobs cannot be used with a read filter");
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
@@ -3583,12 +3712,14 @@ main(int argc, char *argv[])
                 "traffic set up by signalling on another flow (RTP from "
                 "SDP, for example) may be dissected differently");
 
-        /* Output that shows a conversation index - packet details, or
-         * any of the structured formats - needs the extra pass that
-         * works out what the capture as a whole would have numbered
-         * them. Summary columns never show one. */
+        /* A first pass is needed when the output shows a conversation
+         * index - packet details, or any of the structured formats - so
+         * that the numbering is the capture's, and when there is a
+         * display filter, so that every worker knows which frames anyone
+         * displayed. */
         if (!jobs_fork(cf_name, jobs,
-                    print_details || output_action != WRITE_TEXT,
+                    print_details || output_action != WRITE_TEXT ||
+                    dfcode != NULL,
                     (int *)&exit_status)) {
             goto clean_exit;
         }
@@ -5022,7 +5153,9 @@ process_cap_file_second_pass(capture_file *cf, wtap_dumper *pdh,
                 cf->provider.ref = &ref_frame;
             }
             frame_data_set_after_dissect(fdata, &cum_bytes);
-            cf->provider.prev_dis = fdata;
+            if (jobs_was_displayed((uint32_t)framenum)) {
+                cf->provider.prev_dis = fdata;
+            }
             cf->provider.prev_cap = fdata;
             continue;
         }
@@ -5045,6 +5178,11 @@ process_cap_file_second_pass(capture_file *cf, wtap_dumper *pdh,
         switch (process_packet_second_pass(cf, edt, fdata, &rec, tap_flags)) {
 
         case PROCESS_PACKET_PASSED:
+#ifndef _WIN32
+            if (jobs_pass == 1) {
+                jobs_record_displayed((uint32_t)framenum);
+            }
+#endif
             /* Either there's no read filtering or this packet passed the
                filter, so, if we're writing to a capture file, write
                this packet out. */
@@ -5213,6 +5351,11 @@ process_cap_file_single_pass(capture_file *cf, wtap_dumper *pdh,
         switch (process_packet_single_pass(cf, edt, data_offset, &rec,
                                            tap_flags)) {
         case PROCESS_PACKET_PASSED:
+#ifndef _WIN32
+            if (jobs_pass == 1) {
+                jobs_record_displayed((uint32_t)framenum);
+            }
+#endif
             /* Either there's no read filtering or this packet passed the
                filter, so, if we're writing to a capture file, write
                this packet out. */
