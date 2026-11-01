@@ -3749,8 +3749,8 @@ init_ipv6_conversation_data(packet_info *pinfo)
     ipv6d=wmem_new0(wmem_file_scope(), struct ipv6_analysis);
 
     ipv6d->initial_frame = pinfo->num;
-    ipv6d->stream = 0;
-    ipv6d->stream = ordinal_next(&ipv6_stream_ordinal, pinfo->num);
+    ipv6d->stream = ordinal_next_for(&ipv6_stream_ordinal, pinfo->num,
+            ordinal_identity(&pinfo->src, 0, &pinfo->dst, 0));
 
     return ipv6d;
 }

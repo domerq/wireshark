@@ -92,6 +92,7 @@ set(LIBWIRESHARK_PUBLIC_HEADERS
 	nghttp2_hd_huffman.h
 	oids.h
 	osi-utils.h
+	ordinal.h
 	oui.h
 	packet.h
 	packet_info.h
@@ -196,6 +197,7 @@ set(LIBWIRESHARK_NONGENERATED_FILES
 	nghttp2_hd_huffman_data.c
 	oids.c
 	osi-utils.c
+	ordinal.c
 	packet.c
 	print.c
 	print_stream.c

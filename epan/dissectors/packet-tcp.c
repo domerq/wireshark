@@ -11,6 +11,7 @@
 #include "config.h"
 
 #include <epan/packet.h>
+#include <epan/ordinal.h>
 #include <epan/capture_dissectors.h>
 #include <epan/exceptions.h>
 #include <epan/addr_resolv.h>
@@ -1026,8 +1027,10 @@ static dissector_handle_t sport_handle;
 static dissector_handle_t tcp_opt_unknown_handle;
 static capture_dissector_handle_t tcp_cap_handle;
 
-static uint32_t tcp_stream_count;
-static uint32_t mptcp_stream_count;
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t tcp_stream_ordinal = ORDINAL_COUNTER_INIT("tcp.stream");
+static ordinal_counter_t mptcp_stream_ordinal = ORDINAL_COUNTER_INIT("mptcp.stream");
 
 /* Capture-level duplicate / packet-count detection */
 static bool     tcp_detect_duplicate_packets       = false;
@@ -2164,7 +2167,9 @@ init_tcp_conversation_data(packet_info *pinfo, int direction)
     tcpd->ts_first.nsecs=pinfo->abs_ts.nsecs;
     tcpd->ts_prev.secs=pinfo->abs_ts.secs;
     tcpd->ts_prev.nsecs=pinfo->abs_ts.nsecs;
-    tcpd->stream = tcp_stream_count++;
+    tcpd->stream = ordinal_next_for(&tcp_stream_ordinal, pinfo->num,
+            ordinal_identity(&pinfo->src, pinfo->srcport,
+                &pinfo->dst, pinfo->destport));
     tcpd->tfo_syn_data = false;
     tcpd->flow1.mss = -1;
     tcpd->flow2.mss = -1;
@@ -2302,13 +2307,13 @@ add_tcp_process_info(uint32_t frame_num, address *local_addr, address *remote_ad
 /* Return the current stream count */
 uint32_t get_tcp_stream_count(void)
 {
-    return tcp_stream_count;
+    return tcp_stream_ordinal.next;
 }
 
 /* Return the mptcp current stream count */
 uint32_t get_mptcp_stream_count(void)
 {
-    return mptcp_stream_count;
+    return mptcp_stream_ordinal.next;
 }
 
 /* Calculate the timestamps relative to this conversation */
@@ -7123,7 +7128,7 @@ dissect_tcpopt_timestamp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, vo
 }
 
 static struct mptcp_analysis*
-mptcp_alloc_analysis(struct tcp_analysis* tcpd) {
+mptcp_alloc_analysis(struct tcp_analysis* tcpd, uint32_t frame) {
 
     struct mptcp_analysis* mptcpd;
 
@@ -7132,7 +7137,7 @@ mptcp_alloc_analysis(struct tcp_analysis* tcpd) {
     mptcpd = (struct mptcp_analysis*)wmem_new0(wmem_file_scope(), struct mptcp_analysis);
     mptcpd->subflows = wmem_list_new(wmem_file_scope());
 
-    mptcpd->stream = mptcp_stream_count++;
+    mptcpd->stream = ordinal_next(&mptcp_stream_ordinal, frame);
     tcpd->mptcp_analysis = mptcpd;
 
     memset(&mptcpd->meta_flow, 0, 2*sizeof(mptcp_meta_flow_t));
@@ -7147,7 +7152,7 @@ mptcp_alloc_analysis(struct tcp_analysis* tcpd) {
 
 /* will create necessary structure if fails to find a match on the token */
 static struct mptcp_analysis*
-mptcp_get_meta_from_token(struct tcp_analysis* tcpd, tcp_flow_t *tcp_flow, uint32_t token) {
+mptcp_get_meta_from_token(struct tcp_analysis* tcpd, tcp_flow_t *tcp_flow, uint32_t token, uint32_t frame) {
 
     struct mptcp_analysis* result = NULL;
     struct mptcp_analysis* mptcpd = tcpd->mptcp_analysis;
@@ -7174,7 +7179,7 @@ mptcp_get_meta_from_token(struct tcp_analysis* tcpd, tcp_flow_t *tcp_flow, uint3
         /* we create it if this connection */
         if(!mptcpd) {
             /* don't care which meta to choose assign each meta to a direction */
-            mptcpd = mptcp_alloc_analysis(tcpd);
+            mptcpd = mptcp_alloc_analysis(tcpd, frame);
             mptcp_attach_subflow(mptcpd, tcpd);
         }
         else {
@@ -7213,7 +7218,7 @@ mptcp_get_meta_from_token(struct tcp_analysis* tcpd, tcp_flow_t *tcp_flow, uint3
 /* setup from_key */
 static
 struct mptcp_analysis*
-get_or_create_mptcpd_from_key(struct tcp_analysis* tcpd, tcp_flow_t *fwd, uint8_t version, uint64_t key, uint8_t hmac_algo _U_) {
+get_or_create_mptcpd_from_key(struct tcp_analysis* tcpd, tcp_flow_t *fwd, uint8_t version, uint64_t key, uint8_t hmac_algo _U_, uint32_t frame) {
 
     uint32_t token = 0;
     uint64_t expected_idsn= 0;
@@ -7229,7 +7234,7 @@ get_or_create_mptcpd_from_key(struct tcp_analysis* tcpd, tcp_flow_t *fwd, uint8_
     else if (version == 1)
         mptcp_cryptodata_sha256(key, &token, &expected_idsn);
 
-    mptcpd = mptcp_get_meta_from_token(tcpd, fwd, token);
+    mptcpd = mptcp_get_meta_from_token(tcpd, fwd, token, frame);
 
     DISSECTOR_ASSERT(fwd->mptcp_subflow->meta);
 
@@ -7335,7 +7340,7 @@ dissect_tcpopt_mptcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* 
 
     /** preemptively allocate mptcpd when subtype won't allow to find a meta */
     if(!mptcpd && (subtype > TCPOPT_MPTCP_MP_JOIN)) {
-        mptcpd = mptcp_alloc_analysis(tcpd);
+        mptcpd = mptcp_alloc_analysis(tcpd, pinfo->num);
     }
 
     switch (subtype) {
@@ -7369,7 +7374,7 @@ dissect_tcpopt_mptcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* 
                 proto_tree_add_uint64(mptcp_tree, hf_tcp_option_mptcp_sender_key, tvb, offset, 8, mph->mh_key);
                 offset += 8;
 
-                mptcpd = get_or_create_mptcpd_from_key(tcpd, tcpd->fwd, version, mph->mh_key, mph->mh_capable_flags & MPTCP_CAPABLE_CRYPTO_MASK);
+                mptcpd = get_or_create_mptcpd_from_key(tcpd, tcpd->fwd, version, mph->mh_key, mph->mh_capable_flags & MPTCP_CAPABLE_CRYPTO_MASK, pinfo->num);
                 mptcpd->master = tcpd;
 
                 item = proto_tree_add_uint(mptcp_tree,
@@ -7395,7 +7400,7 @@ dissect_tcpopt_mptcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* 
                         }
                     }
                     else {
-                        mptcpd = get_or_create_mptcpd_from_key(tcpd, tcpd->rev, version, recv_key, mph->mh_capable_flags & MPTCP_CAPABLE_CRYPTO_MASK);
+                        mptcpd = get_or_create_mptcpd_from_key(tcpd, tcpd->rev, version, recv_key, mph->mh_capable_flags & MPTCP_CAPABLE_CRYPTO_MASK, pinfo->num);
                     }
                 }
 
@@ -7424,7 +7429,7 @@ dissect_tcpopt_mptcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* 
         case TCPOPT_MPTCP_MP_JOIN:
             mph->mh_join = true;
             if(optlen != 12 && !mptcpd) {
-                mptcpd = mptcp_alloc_analysis(tcpd);
+                mptcpd = mptcp_alloc_analysis(tcpd, pinfo->num);
             }
             switch (optlen) {
                 /* Syn */
@@ -7443,7 +7448,7 @@ dissect_tcpopt_mptcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* 
                             4, ENC_BIG_ENDIAN, &mph->mh_token);
                     offset += 4;
 
-                    mptcpd = mptcp_get_meta_from_token(tcpd, tcpd->rev, mph->mh_token);
+                    mptcpd = mptcp_get_meta_from_token(tcpd, tcpd->rev, mph->mh_token, pinfo->num);
                     if (tcpd->fwd->mptcp_subflow->meta->version == 1) {
                         mptcp_meta_flow_t *tmp = tcpd->fwd->mptcp_subflow->meta;
 
@@ -10645,10 +10650,10 @@ dissect_tcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_)
 static void
 tcp_init(void)
 {
-    tcp_stream_count = 0;
+    ordinal_counter_reset(&tcp_stream_ordinal);
 
     /* MPTCP init */
-    mptcp_stream_count = 0;
+    ordinal_counter_reset(&mptcp_stream_ordinal);
     mptcp_tokens = wmem_tree_new(wmem_file_scope());
 
     /* Capture-level packet-count detection */

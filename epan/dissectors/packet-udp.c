@@ -185,7 +185,9 @@ init_udp_conversation_data(packet_info *pinfo)
     udpd->flow2.command = NULL;
     */
 
-    udpd->stream = ordinal_next(&udp_stream_ordinal, pinfo->num);
+    udpd->stream = ordinal_next_for(&udp_stream_ordinal, pinfo->num,
+            ordinal_identity(&pinfo->src, pinfo->srcport,
+                &pinfo->dst, pinfo->destport));
     udpd->ts_first = pinfo->abs_ts;
     udpd->ts_prev = pinfo->abs_ts;
 

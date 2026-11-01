@@ -20,6 +20,7 @@
 #include <epan/packet.h>
 #include "to_str.h"
 #include "conversation.h"
+#include "ordinal.h"
 
 // The conversation database is a map of maps that contain conversation_t's.
 // Top-level map keys are strings that describe each conversation type.
@@ -208,7 +209,10 @@ static wmem_map_t *conversation_hashtable_deinterlacer = NULL;
  */
 static wmem_map_t *conversation_hashtable_err_pkts = NULL;
 
-static uint32_t new_index;
+/* Conversations are numbered in the order they are first seen, which a
+ * process dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t conversation_ordinal =
+    ORDINAL_COUNTER_INIT("conversation");
 
 /*
  * Placeholder for address-less conversations.
@@ -803,7 +807,7 @@ conversation_epan_reset(void)
     /*
      * Start the conversation indices over at 0.
      */
-    new_index = 0;
+    ordinal_counter_reset(&conversation_ordinal);
 }
 
 /*
@@ -950,10 +954,9 @@ conversation_t *conversation_new_full(const uint32_t setup_frame, conversation_e
     }
 
     conversation_t *conversation = wmem_new0(wmem_file_scope(), conversation_t);
-    conversation->conv_index = new_index;
+    conversation->conv_index = ordinal_next(&conversation_ordinal, setup_frame);
     conversation->setup_frame = conversation->last_frame = setup_frame;
 
-    new_index++;
 
     conversation->key_ptr = conv_key;
     conversation_insert_into_hashtable(el_list_map, conversation);
@@ -1142,14 +1145,13 @@ conversation_new(const uint32_t setup_frame, const address *addr1, const address
 
     conversation = wmem_new0(wmem_file_scope(), conversation_t);
 
-    conversation->conv_index = new_index;
+    conversation->conv_index = ordinal_next(&conversation_ordinal, setup_frame);
     conversation->setup_frame = conversation->last_frame = setup_frame;
 
     /* set the options and key pointer */
     conversation->options = options;
     conversation->key_ptr = new_key;
 
-    new_index++;
 
     DINDENT();
     conversation_insert_into_hashtable(hashtable, conversation);
@@ -1207,10 +1209,9 @@ conversation_t *
 conversation_new_by_id(const uint32_t setup_frame, const conversation_type ctype, const uint32_t id)
 {
     conversation_t *conversation = wmem_new0(wmem_file_scope(), conversation_t);
-    conversation->conv_index = new_index;
+    conversation->conv_index = ordinal_next(&conversation_ordinal, setup_frame);
     conversation->setup_frame = conversation->last_frame = setup_frame;
 
-    new_index++;
 
     conversation_element_t *elements = wmem_alloc(wmem_file_scope(), sizeof(conversation_element_t) * 2);
     elements[0].type = CE_UINT;
@@ -1227,10 +1228,9 @@ conversation_t *
 conversation_new_err_pkts(const uint32_t setup_frame, const conversation_type ctype, const uint32_t id, const uint32_t rid)
 {
     conversation_t *conversation = wmem_new0(wmem_file_scope(), conversation_t);
-    conversation->conv_index = new_index;
+    conversation->conv_index = ordinal_next(&conversation_ordinal, setup_frame);
     conversation->setup_frame = conversation->last_frame = setup_frame;
 
-    new_index++;
 
     conversation_element_t *elements = wmem_alloc(wmem_file_scope(), sizeof(conversation_element_t) * 3);
     elements[0].type = CE_UINT;
@@ -1251,7 +1251,7 @@ conversation_new_deinterlacer(const uint32_t setup_frame, const address *addr1, 
 {
 
     conversation_t *conversation = wmem_new0(wmem_file_scope(), conversation_t);
-    conversation->conv_index = new_index;
+    conversation->conv_index = ordinal_next(&conversation_ordinal, setup_frame);
     conversation->setup_frame = conversation->last_frame = setup_frame;
 
     conversation_element_t *new_key = wmem_alloc(wmem_file_scope(), sizeof(conversation_element_t) * (DEINTR_ENDP_IDX+1));
@@ -1286,7 +1286,6 @@ conversation_new_deinterlacer(const uint32_t setup_frame, const address *addr1, 
 
     conversation->key_ptr = new_key;
 
-    new_index++;
 
     conversation_insert_into_hashtable(conversation_hashtable_deinterlacer, conversation);
 
@@ -1299,7 +1298,7 @@ conversation_new_deinterlaced(const uint32_t setup_frame, const address *addr1, 
 {
 
     conversation_t *conversation = wmem_new0(wmem_file_scope(), conversation_t);
-    conversation->conv_index = new_index;
+    conversation->conv_index = ordinal_next(&conversation_ordinal, setup_frame);
     conversation->setup_frame = conversation->last_frame = setup_frame;
 
     if (options & NO_PORTS) {
@@ -1331,7 +1330,6 @@ conversation_new_deinterlaced(const uint32_t setup_frame, const address *addr1, 
         conversation->options = options;
         conversation->key_ptr = new_key;
 
-        new_index++;
 
         conversation_insert_into_hashtable(conversation_hashtable_exact_addr_anc, conversation);
 
@@ -1363,7 +1361,6 @@ conversation_new_deinterlaced(const uint32_t setup_frame, const address *addr1, 
             conversation->options = options;
             conversation->key_ptr = new_key;
 
-            new_index++;
 
             conversation_insert_into_hashtable(conversation_hashtable_no_addr2_or_port2_anc, conversation);
 
@@ -1397,7 +1394,6 @@ conversation_new_deinterlaced(const uint32_t setup_frame, const address *addr1, 
             conversation->options = options;
             conversation->key_ptr = new_key;
 
-            new_index++;
 
             conversation_insert_into_hashtable(conversation_hashtable_no_addr2_anc, conversation);
 
@@ -1436,7 +1432,6 @@ conversation_new_deinterlaced(const uint32_t setup_frame, const address *addr1, 
         conversation->options = options;
         conversation->key_ptr = new_key;
 
-        new_index++;
 
         conversation_insert_into_hashtable(conversation_hashtable_exact_addr_port_anc, conversation);
 
@@ -1477,7 +1472,6 @@ conversation_new_deinterlaced(const uint32_t setup_frame, const address *addr1, 
         conversation->options = options;
         conversation->key_ptr = new_key;
 
-        new_index++;
 
         conversation_insert_into_hashtable(conversation_hashtable_exact_addr_port_anc, conversation);
 

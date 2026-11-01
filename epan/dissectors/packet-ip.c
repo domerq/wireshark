@@ -1927,8 +1927,8 @@ init_ip_conversation_data(packet_info *pinfo)
     ipd=wmem_new0(wmem_file_scope(), struct ip_analysis);
 
     ipd->initial_frame = pinfo->num;
-    ipd->stream = 0;
-    ipd->stream = ordinal_next(&ip_stream_ordinal, pinfo->num);
+    ipd->stream = ordinal_next_for(&ip_stream_ordinal, pinfo->num,
+            ordinal_identity(&pinfo->src, 0, &pinfo->dst, 0));
 
     return ipd;
 }
