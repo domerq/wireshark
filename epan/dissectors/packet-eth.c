@@ -21,6 +21,7 @@
 #include <epan/capture_dissectors.h>
 #include <epan/exported_pdu.h>
 #include <epan/tfs.h>
+#include <epan/ordinal.h>
 #include <wsutil/pint.h>
 #include "packet-eth.h"
 #include "packet-gre.h"
@@ -115,7 +116,10 @@ static dissector_handle_t eth_header_only_handle;
 
 
 static int eth_tap;
-static uint32_t eth_stream_count;
+
+/* Streams are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t eth_stream_ordinal = ORDINAL_COUNTER_INIT("eth.stream");
 
 static int exported_pdu_tap = -1;
 
@@ -377,8 +381,7 @@ init_eth_conversation_data(packet_info *pinfo)
     ethd=wmem_new0(wmem_file_scope(), struct eth_analysis);
 
     ethd->initial_frame = pinfo->num;
-    ethd->stream = 0;
-    ethd->stream = eth_stream_count++;
+    ethd->stream = ordinal_next(&eth_stream_ordinal, pinfo->num);
 
     return ethd;
 }
@@ -657,7 +660,7 @@ dissect_eth_common(tvbuff_t *tvb, packet_info *pinfo, proto_tree *parent_tree,
 static void
 eth_init(void)
 {
-    eth_stream_count = 0;
+    ordinal_counter_reset(&eth_stream_ordinal);
 }
 
 /* -------------- */

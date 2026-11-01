@@ -52,6 +52,7 @@
 #include <epan/expert.h>
 #include <epan/proto_data.h>
 #include <epan/to_str.h>
+#include <epan/ordinal.h>
 #include "packet-tls-utils.h"
 #include "packet-tls.h"
 #include "packet-tcp.h"     /* used for STREAM reassembly. */
@@ -501,7 +502,11 @@ static wmem_map_t *quic_client_connections, *quic_server_connections;
 static wmem_map_t *quic_initial_connections;    /* Initial.DCID -> connection */
 static wmem_list_t *quic_connections;   /* All unique connections. */
 static uint32_t quic_cid_lengths;        /* Bitmap of CID lengths. */
-static unsigned quic_connections_count;
+
+/* Connections are numbered in the order they are first seen, which a process
+ * dissecting part of a capture cannot work out on its own. */
+static ordinal_counter_t quic_connection_ordinal =
+    ORDINAL_COUNTER_INIT("quic.connection.number");
 
 static unsigned
 quic_multipath_negotiated(quic_info_data_t *conn);
@@ -1352,7 +1357,7 @@ quic_connection_create(packet_info *pinfo, uint32_t version)
 
     conn = wmem_new0(wmem_file_scope(), quic_info_data_t);
     wmem_list_append(quic_connections, conn);
-    conn->number = quic_connections_count++;
+    conn->number = ordinal_next(&quic_connection_ordinal, pinfo->num);
     conn->version = version;
     conn->server_endpoints = wmem_list_new(wmem_file_scope());
     quic_connection_add_server_endpoint(pinfo, conn);
@@ -5404,7 +5409,7 @@ static void
 quic_init(void)
 {
     quic_connections = wmem_list_new(wmem_file_scope());
-    quic_connections_count = 0;
+    ordinal_counter_reset(&quic_connection_ordinal);
     quic_initial_connections = wmem_map_new(wmem_file_scope(), quic_connection_hash, quic_connection_equal);
     quic_client_connections = wmem_map_new(wmem_file_scope(), quic_connection_hash, quic_connection_equal);
     quic_server_connections = wmem_map_new(wmem_file_scope(), quic_connection_hash, quic_connection_equal);
@@ -5622,7 +5627,7 @@ follow_quic_tap_listener(void *tapdata, packet_info *pinfo, epan_dissect_t *edt 
 
 uint32_t get_quic_connections_count(void)
 {
-    return quic_connections_count;
+    return quic_connection_ordinal.next;
 }
 /* Follow QUIC Stream functionality }}} */
 
