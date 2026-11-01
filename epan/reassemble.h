@@ -20,6 +20,22 @@
 extern "C" {
 #endif
 
+/*
+ * Where reassembly state lives:
+ *
+ *   - the tables' keys, the per-fragment bookkeeping and a completed
+ *     reassembly's buffer are allocated from wmem file scope, so they
+ *     last until the capture file is closed and are freed with it. A
+ *     dissector must not free them.
+ *   - the copy of each fragment's payload is allocated from an arena of
+ *     its own, because it is dropped as soon as its reassembly completes
+ *     while everything around it lives until the file is closed. Mixing
+ *     those two lifetimes in one arena pins it at the sum of both.
+ *
+ * The one thing a caller does own is the tvbuff fragment_delete() hands
+ * back; see there.
+ */
+
 /* in fd_head: packet is defragmented
  * in item: this item was used in defragmentation
  * (An item can have this set when the head does not if defragmentation
@@ -812,12 +828,13 @@ fragment_get_reassembled_id(reassembly_table *table, const packet_info *pinfo,
 /**
  * @brief Deletes a fragment from the reassembly table.
  *
- * This will free up all resources and delete reassembly state for this PDU.
- * Except if the PDU is completely reassembled, then it would NOT deallocate the
- * buffer holding the reassembled data but instead return the TVB
+ * This deletes the reassembly state for this PDU. Except if the PDU is
+ * completely reassembled, in which case the tvbuff holding the
+ * reassembled data is returned rather than freed.
  *
- * So, if you call fragment_delete and it returns non-NULL, YOU are responsible to
- * tvb_free() .
+ * So, if you call fragment_delete and it returns non-NULL, YOU are
+ * responsible to tvb_free() it. The data the tvbuff wraps belongs to
+ * file scope either way, so this hands over the tvbuff, not the bytes.
  *
  * @param table The reassembly table.
  * @param pinfo Packet information.
