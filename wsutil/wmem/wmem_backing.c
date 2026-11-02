@@ -527,16 +527,25 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
         return;
     }
 
+    /* Give the pages back before the region is marked free, and with
+     * the lock not held: the kernel work is the expensive part of a
+     * free, and holding a lock that every process needs across a
+     * syscall would serialize them on it. The region still counts as
+     * handed out while this happens, so nothing else can be given the
+     * bytes being discarded. */
     pthread_mutex_lock(&shared->lock);
-
     at     = wmem_backing_region_of(backing, ptr);
     offset = shared->regions[at].offset;
     size   = shared->regions[at].size;
-
-    shared->regions[at].used = 0;
-    shared->live -= size;
+    pthread_mutex_unlock(&shared->lock);
 
     wmem_backing_release(backing, ptr, offset, (size_t)size);
+
+    pthread_mutex_lock(&shared->lock);
+
+    at = wmem_backing_region_of(backing, ptr);
+    shared->regions[at].used = 0;
+    shared->live -= size;
 
     /* Merge with the region before and the region after, so that the
      * space goes back as one extent rather than as a size that may never
