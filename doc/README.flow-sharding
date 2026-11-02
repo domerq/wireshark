@@ -75,6 +75,15 @@ for packets it never dissects (jobs_skip_packet() in tshark.c). Without
 that, every time column would be measured from each worker's own first
 packet.
 
+The parent reaps the workers as they finish rather than in order. A
+worker that stops on a bad file has printed the packets it got through,
+exactly as a single process would have, so its exit status is passed on
+and its output is still merged. One that is killed is different: with
+--spill-dir it may have been holding the lock on the store they all
+allocate from, and a lock whose owner is gone is never released, so the
+parent kills the rest of the pass and fails the run rather than leaving
+the survivors waiting on it for ever.
+
 5. Numbering things in the order they are first seen
 ----------------------------------------------------
 

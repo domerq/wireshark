@@ -1207,7 +1207,8 @@ static bool
 jobs_run_pass(jobs_worker_t *workers, unsigned count, unsigned pass,
         int *worker_status, bool *failed)
 {
-    unsigned i;
+    unsigned i, remaining;
+    bool     stopped_rest = false;
 
     /* Fork after epan_init(), so the dissector tables are set up once and
      * shared copy-on-write, and so that each worker inherits a complete,
@@ -1227,21 +1228,60 @@ jobs_run_pass(jobs_worker_t *workers, unsigned count, unsigned pass,
         workers[i].pid = pid;
     }
 
-    /* A worker that stopped on a bad file has still printed the packets
+    /* Reap them as they finish rather than in order, so that a worker
+     * that dies is noticed while the others are still running.
+     *
+     * A worker that stopped on a bad file has still printed the packets
      * it got through, exactly as a single process would have, so its
      * status is passed on rather than replaced and its output is still
-     * written out. */
-    for (i = 0; i < count; i++) {
-        int status = 0;
+     * written out. One that was killed is different: it may have been
+     * holding the lock on the store all of them allocate from, and
+     * there is no taking a lock back from a process that is gone, so
+     * the rest of the pass is killed rather than left waiting on it for
+     * ever. */
+    remaining = count;
+    while (remaining > 0) {
+        int   status = 0;
+        pid_t pid;
 
-        if (waitpid(workers[i].pid, &status, 0) < 0) {
-            cmdarg_err("Can't wait for worker %u: %s", i, g_strerror(errno));
+        pid = waitpid(-1, &status, 0);
+        if (pid < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            cmdarg_err("Can't wait for the workers: %s", g_strerror(errno));
             *failed = true;
+            break;
         }
-        else if (WIFSIGNALED(status)) {
-            cmdarg_err("Worker %u was killed by signal %d", i,
-                    WTERMSIG(status));
+
+        for (i = 0; i < count; i++) {
+            if (workers[i].pid == pid) {
+                break;
+            }
+        }
+        if (i == count) {
+            /* Something else's child. */
+            continue;
+        }
+        workers[i].pid = 0;
+        remaining--;
+
+        if (WIFSIGNALED(status)) {
+            if (stopped_rest && WTERMSIG(status) == SIGKILL) {
+                /* One of the ones stopped just below. */
+                continue;
+            }
+
+            cmdarg_err("Worker %u was killed by signal %d; stopping the "
+                    "rest of the run", i, WTERMSIG(status));
             *failed = true;
+
+            for (unsigned j = 0; j < count; j++) {
+                if (workers[j].pid != 0) {
+                    kill(workers[j].pid, SIGKILL);
+                }
+            }
+            stopped_rest = true;
         }
         else if (WEXITSTATUS(status) != EXIT_SUCCESS) {
             *worker_status = WEXITSTATUS(status);
