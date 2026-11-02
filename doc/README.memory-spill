@@ -279,6 +279,13 @@ silently compiles out while everything still works, just without returning
 disk blocks. Windows has no equivalent of the mapping scheme used here, so
 wmem_backing_file_new() fails there and --spill-dir reports the error.
 
+Both paths are verified: on ext4 the store's file is sparse - 64 GB of
+address space against the few hundred megabytes actually in use - and holding
+512 MB and then freeing it returns exactly 512 MB of free space, so the
+blocks really do come back. The shared bookkeeping works the same on both:
+four forked workers allocating from one store give byte-identical output on
+Linux and macOS alike.
+
 Resident set size is a misleading measure on both platforms: resident pages
 of the backing file count towards it even though they are evictable without
 swap. On macOS use "peak memory footprint" or the malloc interposer in

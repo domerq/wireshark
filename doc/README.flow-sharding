@@ -254,6 +254,13 @@ records so the copying overlaps the printing (13.9 s against 13.0 s).
 Ordered output wants unbounded room to run ahead in, and a file is the
 cheapest way to have it.
 
+The measurements above are macOS on an Apple M4. The same capture on
+Ubuntu 26.04, aarch64, eight cores, gives the same shape: summary
+output 4.17 s against 2.52 s with four workers, packet details 20.01 s
+against 12.73 s, everything spilled 5.45 s against 3.91 s, and the same
+252 of 254 captures byte-identical under --jobs 3. The two that differ
+are the two listed in section 8.
+
 The store is created before the fork and every worker allocates from
 it, so --spill-after is a watermark for the run and not for each
 worker, which matters because the worker that gets the largest
