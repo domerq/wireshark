@@ -26,6 +26,7 @@
 #include <epan/prefs.h>
 #include <epan/print.h>
 #include <wsutil/array.h>
+#include <wsutil/time_util.h>
 #include <wsutil/json_dumper.h>
 #include <wsutil/filesystem.h>
 #include <wsutil/utf8_entities.h>
@@ -743,10 +744,11 @@ static void
 write_json_index(json_dumper *dumper, epan_dissect_t *edt)
 {
     char ts[30];
+    struct tm   broken_down;
     struct tm * timeinfo;
     char* str;
 
-    timeinfo = localtime(&edt->pi.abs_ts.secs);
+    timeinfo = ws_localtime_r(&edt->pi.abs_ts.secs, &broken_down);
     if (timeinfo != NULL) {
         strftime(ts, sizeof(ts), "%Y-%m-%d", timeinfo);
     } else {

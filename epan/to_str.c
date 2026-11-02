@@ -20,6 +20,7 @@
 #include "to_str.h"
 #include "strutil.h"
 #include <wsutil/pint.h>
+#include <wsutil/time_util.h>
 #include <wsutil/utf8_entities.h>
 
 /*
@@ -96,13 +97,17 @@ get_zonename(struct tm *tmp)
 static struct tm *
 get_fmt_broken_down_time(field_display_e fmt, const time_t *secs)
 {
+    /* The same static-buffer contract as gmtime() and localtime(): the
+     * caller formats the result before anything else asks for a time. */
+    static struct tm broken_down;
+
     switch (fmt) {
         case ABSOLUTE_TIME_UTC:
         case ABSOLUTE_TIME_DOY_UTC:
         case ABSOLUTE_TIME_NTP_UTC:
-            return gmtime(secs);
+            return ws_gmtime_r(secs, &broken_down);
         case ABSOLUTE_TIME_LOCAL:
-            return localtime(secs);
+            return ws_localtime_r(secs, &broken_down);
         default:
             break;
     }
