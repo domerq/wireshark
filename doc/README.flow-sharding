@@ -231,6 +231,29 @@ identical to an unspilled run in both cases: sharding and spilling help
 each other, because the state is divided along with the packets and a
 smaller arena is a warmer one.
 
+Packet details (-V), where the output is 4 GB rather than 60 MB and
+every packet costs two dissections because the numbering needs a first
+pass:
+
+    workers    wall
+    1         22.14 s
+    2         18.28 s
+    4         14.26 s
+    8         17.01 s
+
+Less than the summary case gains, and for a reason worth knowing: what
+a worker spends its time on here is formatting, and the output has to
+come out in frame order. Each worker prints into a spool of its own and
+the parent copies the spools out in order afterwards, which lets a
+worker print a long run of the capture without waiting for anything.
+Two alternatives were tried and both came out slower: sending the
+bytes to the parent as they are printed (19.5 s against 12.7 s on the
+same machine, because a worker then waits whenever its channel fills
+and the output is elsewhere), and keeping the spools but streaming the
+records so the copying overlaps the printing (13.9 s against 13.0 s).
+Ordered output wants unbounded room to run ahead in, and a file is the
+cheapest way to have it.
+
 The store is created before the fork and every worker allocates from
 it, so --spill-after is a watermark for the run and not for each
 worker, which matters because the worker that gets the largest
