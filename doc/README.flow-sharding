@@ -217,16 +217,16 @@ the run. Each worker also reads the whole file, and the index pass reads
 it once more.
 
 With everything spilled to disk (--spill-dir, --spill-after 0) the same
-capture takes 3.97 s serially and 2.54 s with 4 workers, output
-identical to an unspilled run in both cases. The store is created
-before the fork and every worker allocates from it, so --spill-after is
-a watermark for the run: at --spill-after 512M, one worker and four
-workers both peak at about 508 MB in RAM. Sharding and spilling help
-each other: the state is divided along with the packets, and a smaller
-arena is a warmer one. The peak on disk falls as workers are added
-(1528 MB serially, 1313 MB at 4 workers, 1136 MB at 8), because one
-worker's flows end and their state is freed while the others are still
-running.
+capture takes 4.19 s serially and 2.57 s with 4 workers, output
+identical to an unspilled run in both cases: sharding and spilling help
+each other, because the state is divided along with the packets and a
+smaller arena is a warmer one.
+
+The store is created before the fork and every worker allocates from
+it, so --spill-after is a watermark for the run and not for each
+worker, which matters because the worker that gets the largest
+conversation needs the most memory. At --spill-after 512M, one worker
+and four workers both peak at about 508 MB in RAM (4.08 s and 2.68 s).
 
 10. Limits and next steps
 -------------------------
