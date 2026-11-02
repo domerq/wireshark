@@ -61,13 +61,18 @@ allocator's own chunk logic - has to know where the memory lives. Pages are
 resident only while in use; under memory pressure the kernel writes them to
 the backing file rather than failing the allocation.
 
-Within a mapping the store keeps a free list of start and end addresses: a
-region being freed is merged with its neighbours, and a request is served
-from the smallest free region that holds it. That matters for processes
-that outlive one capture file, because jumbo allocations are page-rounded
-to sizes that need not ever recur. When nothing mapped can hold a request,
-the store maps another range rather than failing, so --spill-reserve is a
-starting size and not a ceiling.
+The store records its regions - each either handed out or free - as file
+offsets in a shared anonymous mapping, with a PTHREAD_PROCESS_SHARED
+mutex around them. A region being freed is merged with its neighbours,
+and a request is served from the smallest free region that holds it,
+which matters for processes that outlive one capture file because jumbo
+allocations are page-rounded to sizes that need not ever recur. Keeping
+the bookkeeping where processes share it rather than on the private heap
+is what lets a process that forks after the store is created allocate
+from the same store; offsets rather than addresses mean no process has
+to map a piece of the file where any other one did. When nothing mapped
+can hold a request, the store maps another range rather than failing, so
+--spill-reserve is a starting size and not a ceiling.
 
 The block allocator took all of its OS memory from exactly three places
 (8 MB blocks, jumbo allocations, and their frees), so pointing it at a store
@@ -224,8 +229,10 @@ would subsume -M without discarding anything that is still reachable.
 
 Flow sharding attacks the same locality problem from the other side, by
 making each process's arena smaller, and --jobs now does it: see
-README.flow-sharding. With --jobs every worker gets a store of its own
-and divides the --spill-after watermark between them.
+README.flow-sharding. The store is created before the workers are
+forked and all of them allocate from it, so --spill-after stays a
+watermark for the run and the worker holding the largest conversation
+can use as much of it as that conversation needs.
 
 GUI. Wireshark takes the same three options and creates the store where
 TShark does, before epan_init() in ui/qt/main.cpp, and needs nothing else.
