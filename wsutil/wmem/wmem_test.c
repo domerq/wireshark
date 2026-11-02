@@ -14,6 +14,11 @@
 #include <stdio.h>
 #include <glib.h>
 
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #include "wmem.h"
 #include "wmem_tree-int.h"
 #include "wmem_allocator.h"
@@ -469,6 +474,78 @@ wmem_test_backing_grow(void)
 
     wmem_backing_destroy(backing);
 }
+
+#ifndef _WIN32
+/* Processes that fork after the store is created allocate from the same
+ * store, so no two of them may be handed the same bytes, and what one
+ * frees the others may be given. Each child fills its regions with a
+ * pattern of its own and checks them, so an overlap shows up as the
+ * wrong byte rather than as a number that happens to add up. */
+static void
+wmem_test_backing_shared(void)
+{
+    const unsigned  children = 4;
+    const size_t    chunk    = 1024 * 1024;
+    wmem_backing_t *backing;
+    char           *err = NULL;
+    pid_t           pids[4];
+    unsigned        i;
+
+    backing = wmem_backing_file_new(NULL, UINT64_C(8) * 1024 * 1024, 0,
+            &err);
+    if (backing == NULL) {
+        g_test_skip(err);
+        g_free(err);
+        return;
+    }
+
+    for (i = 0; i < children; i++) {
+        pids[i] = fork();
+        g_assert_cmpint(pids[i], >=, 0);
+
+        if (pids[i] == 0) {
+            uint8_t  pattern = (uint8_t)(0x10 + i);
+            unsigned round;
+
+            for (round = 0; round < 50; round++) {
+                uint8_t *held[8];
+                unsigned j;
+
+                for (j = 0; j < G_N_ELEMENTS(held); j++) {
+                    held[j] = (uint8_t *)wmem_backing_alloc(backing,
+                            chunk + j * 64 * 1024);
+                    memset(held[j], pattern, chunk);
+                }
+                for (j = 0; j < G_N_ELEMENTS(held); j++) {
+                    size_t k;
+
+                    for (k = 0; k < chunk; k += 4096) {
+                        if (held[j][k] != pattern) {
+                            _exit(1);
+                        }
+                    }
+                    wmem_backing_free(backing, held[j]);
+                }
+            }
+            _exit(0);
+        }
+    }
+
+    for (i = 0; i < children; i++) {
+        int status = 0;
+
+        g_assert_cmpint(waitpid(pids[i], &status, 0), ==, pids[i]);
+        g_assert_true(WIFEXITED(status));
+        g_assert_cmpint(WEXITSTATUS(status), ==, 0);
+    }
+
+    /* Everything the children took, they gave back. */
+    g_assert_cmpuint(wmem_backing_bytes_live(backing), ==, 0);
+    g_assert_cmpuint(wmem_backing_bytes_high_water(backing), >, 0);
+
+    wmem_backing_destroy(backing);
+}
+#endif /* _WIN32 */
 
 static void
 wmem_test_allocator_block_fast(void)
@@ -1594,6 +1671,9 @@ main(int argc, char **argv)
     g_test_add_func("/wmem/allocator/blk_backed", wmem_test_allocator_block_backed);
     g_test_add_func("/wmem/backing/reuse",      wmem_test_backing_reuse);
     g_test_add_func("/wmem/backing/grow",       wmem_test_backing_grow);
+#ifndef _WIN32
+    g_test_add_func("/wmem/backing/shared",     wmem_test_backing_shared);
+#endif
     g_test_add_func("/wmem/allocator/blk_fast",  wmem_test_allocator_block_fast);
     g_test_add_func("/wmem/allocator/simple",    wmem_test_allocator_simple);
     g_test_add_func("/wmem/allocator/strict",    wmem_test_allocator_strict);
