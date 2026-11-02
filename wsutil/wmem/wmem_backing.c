@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include <sys/types.h>
 #ifdef __linux__
 /* FALLOC_FL_PUNCH_HOLE lives here, not in <fcntl.h>. */
@@ -36,49 +37,82 @@
 #endif
 #endif
 
+/*
+ * Everything the store knows about which bytes are handed out lives in a
+ * shared anonymous mapping, in file offsets rather than addresses, and
+ * behind a lock that works between processes. A process that forks after
+ * the store is created therefore allocates from the same store as its
+ * parent and its siblings, with one watermark and one set of figures for
+ * all of them.
+ *
+ * Offsets rather than addresses because nothing dereferences another
+ * process's memory: workers keep their own dissection state, so all that
+ * has to be agreed is who owns which bytes. Each process maps the file
+ * where its own kernel likes.
+ */
+
+#define WMEM_BACKING_MAX_SEGMENTS 256
+#define WMEM_BACKING_MAX_REGIONS  (64 * 1024)
+
 /* One mapped piece of the backing file. The store starts with a single
  * piece and maps another when it runs out, so the reserved size is where
  * the store starts rather than how far it can go. */
 typedef struct {
-    uint8_t    *base;      /* start of the mapping */
     uint64_t    offset;    /* where it lives in the backing file */
     uint64_t    size;
 } wmem_backing_segment_t;
 
-struct _wmem_backing_t {
-    int         fd;
-    char       *path;
-    GArray     *segments;
-    uint64_t    reserve;   /* total size of the mappings */
-    uint64_t    grow;      /* size to map when the mappings are full */
+/* A run of the file, either handed out or free. Regions are kept in
+ * offset order, so a region being freed can be merged with its
+ * neighbours and an allocation can be served from the smallest free one
+ * that holds it. Without merging and splitting, a size that never
+ * recurs - every jumbo allocation is its own size - would pin the space
+ * it was carved from for the life of the store. */
+typedef struct {
+    uint64_t    offset;
+    uint64_t    size;
+    uint32_t    used;
+    uint32_t    segment;
+} wmem_backing_region_t;
+
+typedef struct {
+    pthread_mutex_t lock;
+
+    uint64_t    reserve;   /* total size of the file that is mapped */
+    uint64_t    grow;      /* size to add when it is all handed out */
     uint64_t    live;      /* bytes currently handed out from the file */
     uint64_t    high_water;
-    size_t      pagesize;
 
-    /* Regions are served from the heap until this much is outstanding, and
-     * from the file after that. Analysis that fits in memory therefore costs
-     * nothing, and only the excess pays for the disk. */
+    /* Regions are served from the heap until this much is outstanding,
+     * and from the file after that, so analysis that fits in memory
+     * costs nothing and only the excess pays for the disk. The memory
+     * itself is each process's own; only the budget is shared. */
     uint64_t    threshold;
     uint64_t    heap_live;
     uint64_t    heap_high_water;
 
-    /* region pointer -> region size. Frees come in without a size, and we
-     * want regions to stay page-aligned, so the sizes live beside the data
-     * rather than in a header. One entry per multi-megabyte region makes
-     * this metadata negligible. The heap map doubles as the record of which
-     * source a region came from. */
-    GHashTable *sizes;
-    GHashTable *heap_sizes;
+    unsigned    segment_count;
+    unsigned    region_count;
 
-    /* Free regions: start -> size, and end -> start. A region being freed
-     * is merged with the free regions on either side of it, and an
-     * allocation is served from the smallest free region that holds it,
-     * splitting off the remainder. Without merging and splitting, a size
-     * that never recurs - every jumbo allocation is its own size - would
-     * pin the space it was carved from for the life of the store, and a
-     * long-lived process would exhaust the range with most of it free. */
-    GHashTable *free_starts;
-    GHashTable *free_ends;
+    wmem_backing_segment_t segments[WMEM_BACKING_MAX_SEGMENTS];
+    wmem_backing_region_t  regions[WMEM_BACKING_MAX_REGIONS];
+} wmem_backing_shared_t;
+
+struct _wmem_backing_t {
+    int         fd;
+    char       *path;
+    size_t      pagesize;
+
+    wmem_backing_shared_t *shared;
+
+    /* Where this process has put each segment, which is nobody else's
+     * business. A process maps a segment the first time it needs one. */
+    uint8_t    *bases[WMEM_BACKING_MAX_SEGMENTS];
+    unsigned    mapped;
+
+    /* Heap regions are this process's own, so their sizes are too. The
+     * map doubles as the record of which source a region came from. */
+    GHashTable *heap_sizes;
 };
 
 static inline uint64_t
@@ -87,42 +121,103 @@ wmem_backing_round_up(uint64_t value, uint64_t multiple)
     return ((value + multiple - 1) / multiple) * multiple;
 }
 
-/* Record a region as free, or stop recording it. */
-static void
-wmem_backing_free_add(wmem_backing_t *backing, uint8_t *ptr, size_t size)
+/* Make sure this process has the segment mapped, and say where. */
+static uint8_t *
+wmem_backing_base(wmem_backing_t *backing, unsigned segment)
 {
-    g_hash_table_insert(backing->free_starts, ptr, GSIZE_TO_POINTER(size));
-    g_hash_table_insert(backing->free_ends, ptr + size, ptr);
+#ifdef _WIN32
+    (void)backing; (void)segment;
+    ws_assert_not_reached();
+#else
+    void *base;
+
+    if (segment < backing->mapped && backing->bases[segment] != NULL) {
+        return backing->bases[segment];
+    }
+
+    ws_assert(segment < backing->shared->segment_count);
+
+    base = mmap(NULL, (size_t)backing->shared->segments[segment].size,
+            PROT_READ | PROT_WRITE, MAP_SHARED, backing->fd,
+            (off_t)backing->shared->segments[segment].offset);
+    if (base == MAP_FAILED) {
+        ws_error("wmem: can't map %" PRIu64 " bytes of the backing file: %s",
+                backing->shared->segments[segment].size, g_strerror(errno));
+    }
+
+#ifdef MADV_RANDOM
+    /* Dissection state is reached through hash tables and trees, so a
+     * fault says nothing about which page is wanted next. Reading ahead
+     * around it would just multiply the I/O. */
+    madvise(base, (size_t)backing->shared->segments[segment].size,
+            MADV_RANDOM);
+#endif
+
+    backing->bases[segment] = (uint8_t *)base;
+    if (segment >= backing->mapped) {
+        backing->mapped = segment + 1;
+    }
+
+    return backing->bases[segment];
+#endif /* _WIN32 */
 }
 
-static void
-wmem_backing_free_take(wmem_backing_t *backing, uint8_t *ptr, size_t size)
+static void *
+wmem_backing_address(wmem_backing_t *backing, const wmem_backing_region_t *r)
 {
-    g_hash_table_remove(backing->free_starts, ptr);
-    g_hash_table_remove(backing->free_ends, ptr + size);
+    return wmem_backing_base(backing, r->segment) +
+        (r->offset - backing->shared->segments[r->segment].offset);
 }
 
-/* Which mapping a region came from. There is one segment per growth step,
- * so this list is short and a scan is cheaper than an index. */
-static const wmem_backing_segment_t *
-wmem_backing_segment_of(wmem_backing_t *backing, const uint8_t *ptr)
+/* Which region a pointer came from. There is one region per
+ * multi-megabyte allocation, so this list stays short. */
+static unsigned
+wmem_backing_region_of(wmem_backing_t *backing, const void *ptr)
 {
     unsigned i;
 
-    for (i = 0; i < backing->segments->len; i++) {
-        const wmem_backing_segment_t *segment =
-            &g_array_index(backing->segments, wmem_backing_segment_t, i);
+    for (i = 0; i < backing->shared->region_count; i++) {
+        wmem_backing_region_t *r = &backing->shared->regions[i];
 
-        if (ptr >= segment->base && ptr < segment->base + segment->size) {
-            return segment;
+        if (!r->used || r->segment >= backing->mapped ||
+                backing->bases[r->segment] == NULL) {
+            continue;
+        }
+        if (ptr == wmem_backing_address(backing, r)) {
+            return i;
         }
     }
 
     ws_assert_not_reached();
 }
 
-/* Map another piece of the backing file and make it available. Returns
- * false with *err set if the OS will not give us the space. */
+static void
+wmem_backing_region_insert(wmem_backing_shared_t *shared, unsigned at,
+        uint64_t offset, uint64_t size, unsigned segment, uint32_t used)
+{
+    if (shared->region_count == WMEM_BACKING_MAX_REGIONS) {
+        ws_error("wmem: the backing store is in too many pieces");
+    }
+
+    memmove(&shared->regions[at + 1], &shared->regions[at],
+            (shared->region_count - at) * sizeof(shared->regions[0]));
+    shared->regions[at].offset  = offset;
+    shared->regions[at].size    = size;
+    shared->regions[at].segment = segment;
+    shared->regions[at].used    = used;
+    shared->region_count++;
+}
+
+static void
+wmem_backing_region_remove(wmem_backing_shared_t *shared, unsigned at)
+{
+    shared->region_count--;
+    memmove(&shared->regions[at], &shared->regions[at + 1],
+            (shared->region_count - at) * sizeof(shared->regions[0]));
+}
+
+/* Add another piece of the backing file. Returns false with *err set if
+ * the OS will not give us the space. */
 static bool
 wmem_backing_map_segment(wmem_backing_t *backing, uint64_t size, char **err)
 {
@@ -131,89 +226,70 @@ wmem_backing_map_segment(wmem_backing_t *backing, uint64_t size, char **err)
     *err = g_strdup("disk-backed memory is not supported on this platform");
     return false;
 #else
-    wmem_backing_segment_t segment;
-    void                  *base;
-    uint64_t               offset = backing->reserve;
+    wmem_backing_shared_t *shared = backing->shared;
+    uint64_t               offset = shared->reserve;
 
-    /* Sparse: this sets the size of the file, it does not allocate any disk
-     * blocks. Blocks are allocated as pages are written back. */
+    if (shared->segment_count == WMEM_BACKING_MAX_SEGMENTS) {
+        *err = g_strdup("the backing store is in too many pieces");
+        return false;
+    }
+
+    /* Sparse: this sets the size of the file, it does not allocate any
+     * disk blocks. Blocks are allocated as pages are written back. */
     if (ftruncate(backing->fd, (off_t)(offset + size)) != 0) {
         *err = g_strdup_printf("can't size %s to %" PRIu64 " bytes: %s",
                 backing->path, offset + size, g_strerror(errno));
         return false;
     }
 
-    /* Map the whole piece at once. Addresses handed out of it are stable
-     * for the lifetime of the store, so nothing above us has to care that
-     * the memory is file-backed. */
-    base = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED,
-            backing->fd, (off_t)offset);
-    if (base == MAP_FAILED) {
-        *err = g_strdup_printf("can't map %" PRIu64 " bytes of %s: %s",
-                size, backing->path, g_strerror(errno));
-        return false;
-    }
+    shared->segments[shared->segment_count].offset = offset;
+    shared->segments[shared->segment_count].size   = size;
+    shared->segment_count++;
+    shared->reserve += size;
 
-#ifdef MADV_RANDOM
-    /* Dissection state is reached through hash tables and trees, so a fault
-     * says nothing about which page is wanted next. Reading ahead around it
-     * would just multiply the I/O. */
-    madvise(base, (size_t)size, MADV_RANDOM);
-#endif
-
-    segment.base   = (uint8_t *)base;
-    segment.offset = offset;
-    segment.size   = size;
-    g_array_append_val(backing->segments, segment);
-
-    backing->reserve += size;
-
-    /* A new mapping is one free region. */
-    wmem_backing_free_add(backing, segment.base, (size_t)size);
+    /* A new piece of the file is one free region. */
+    wmem_backing_region_insert(shared, shared->region_count, offset, size,
+            shared->segment_count - 1, 0);
 
     return true;
 #endif /* _WIN32 */
 }
 
-/* Hand the pages of a region back to the OS, and the disk blocks back to the
- * filesystem where we can. The region stays mapped and stays ours; it just
- * stops costing anything until it is handed out again. */
+/* Hand the pages of a region back to the OS, and the disk blocks back to
+ * the filesystem where we can. The region stays mapped and stays ours; it
+ * just stops costing anything until it is handed out again. */
 static void
-wmem_backing_release(wmem_backing_t *backing, void *ptr, size_t size)
+wmem_backing_release(wmem_backing_t *backing, void *ptr, uint64_t offset,
+        size_t size)
 {
 #ifndef _WIN32
-    const wmem_backing_segment_t *segment = wmem_backing_segment_of(backing,
-            (uint8_t *)ptr);
-    off_t offset = (off_t)(segment->offset +
-            (uint64_t)((uint8_t *)ptr - segment->base));
-
 #if defined(__APPLE__) && defined(F_PUNCHHOLE)
     {
         fpunchhole_t args;
 
         memset(&args, 0, sizeof(args));
-        args.fp_offset = offset;
+        args.fp_offset = (off_t)offset;
         args.fp_length = (off_t)size;
-        /* Best effort; a filesystem that cannot punch holes just keeps the
-         * blocks allocated. */
+        /* Best effort; a filesystem that cannot punch holes just keeps
+         * the blocks allocated. */
         fcntl(backing->fd, F_PUNCHHOLE, &args);
     }
 #elif defined(FALLOC_FL_PUNCH_HOLE)
     fallocate(backing->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-            offset, (off_t)size);
+            (off_t)offset, (off_t)size);
 #else
     (void)offset;
 #endif
 
-    /* Discard the pages without writing them back; the contents of a freed
-     * region are not ours to preserve. */
+    /* Discard the pages without writing them back; the contents of a
+     * freed region are not ours to preserve. */
 #ifdef MADV_DONTNEED
     madvise(ptr, size, MADV_DONTNEED);
 #elif defined(MADV_FREE)
     madvise(ptr, size, MADV_FREE);
 #endif
 #else /* _WIN32 */
-    (void)backing; (void)ptr; (void)size;
+    (void)backing; (void)ptr; (void)offset; (void)size;
 #endif
 }
 
@@ -226,10 +302,12 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
     *err = g_strdup("disk-backed memory is not supported on this platform");
     return NULL;
 #else
-    wmem_backing_t *backing;
-    char           *path;
-    int             fd;
-    size_t          pagesize;
+    wmem_backing_t      *backing;
+    char                *path;
+    int                  fd;
+    size_t               pagesize;
+    void                *shared;
+    pthread_mutexattr_t  attr;
 
     pagesize = (size_t)getpagesize();
     reserve  = wmem_backing_round_up(reserve, pagesize);
@@ -244,18 +322,35 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
         return NULL;
     }
 
+    /* The bookkeeping goes in a shared anonymous mapping rather than in
+     * this process's heap, so that processes forked from here allocate
+     * from the same store rather than from a copy of it. */
+    shared = mmap(NULL, sizeof(wmem_backing_shared_t),
+            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED) {
+        *err = g_strdup_printf("can't map %zu bytes for the backing store: "
+                "%s", sizeof(wmem_backing_shared_t), g_strerror(errno));
+        ws_close(fd);
+        g_unlink(path);
+        g_free(path);
+        return NULL;
+    }
+    memset(shared, 0, sizeof(wmem_backing_shared_t));
+
     backing             = g_new0(wmem_backing_t, 1);
     backing->fd         = fd;
     backing->path       = path;
-    backing->segments   = g_array_new(FALSE, FALSE,
-            sizeof(wmem_backing_segment_t));
-    backing->grow       = reserve;
-    backing->threshold  = threshold;
     backing->pagesize   = pagesize;
-    backing->sizes      = g_hash_table_new(g_direct_hash, g_direct_equal);
+    backing->shared     = (wmem_backing_shared_t *)shared;
     backing->heap_sizes = g_hash_table_new(g_direct_hash, g_direct_equal);
-    backing->free_starts = g_hash_table_new(g_direct_hash, g_direct_equal);
-    backing->free_ends  = g_hash_table_new(g_direct_hash, g_direct_equal);
+
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&backing->shared->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+
+    backing->shared->grow      = reserve;
+    backing->shared->threshold = threshold;
 
     if (!wmem_backing_map_segment(backing, reserve, err)) {
         g_unlink(path);
@@ -263,8 +358,9 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
         return NULL;
     }
 
-    /* The mapping keeps the file alive; unlinking now means no leftovers if
-     * we die, and no way for anything else to read the capture state. */
+    /* The mapping keeps the file alive; unlinking now means no leftovers
+     * if we die, and no way for anything else to read the capture
+     * state. */
     g_unlink(path);
 
     return backing;
@@ -282,96 +378,96 @@ wmem_backing_destroy(wmem_backing_t *backing)
     {
         unsigned i;
 
-        for (i = 0; i < backing->segments->len; i++) {
-            const wmem_backing_segment_t *segment =
-                &g_array_index(backing->segments, wmem_backing_segment_t, i);
-
-            munmap(segment->base, (size_t)segment->size);
+        for (i = 0; i < backing->mapped; i++) {
+            if (backing->bases[i] != NULL) {
+                munmap(backing->bases[i],
+                        (size_t)backing->shared->segments[i].size);
+            }
         }
     }
     ws_close(backing->fd);
+    munmap(backing->shared, sizeof(wmem_backing_shared_t));
 #endif
 
-    g_array_free(backing->segments, TRUE);
-
-    g_hash_table_destroy(backing->sizes);
     g_hash_table_destroy(backing->heap_sizes);
-    g_hash_table_destroy(backing->free_starts);
-    g_hash_table_destroy(backing->free_ends);
     g_free(backing->path);
     g_free(backing);
 }
 
-/* The smallest free region that holds want bytes, or NULL. */
-static uint8_t *
-wmem_backing_best_fit(wmem_backing_t *backing, size_t want, size_t *found)
+/* The smallest free region that holds want bytes, or the region count if
+ * there is none. Best fit, so that a long run of free space is left for
+ * the request that needs all of it; the list stays short because
+ * neighbours are merged as they are freed. */
+static unsigned
+wmem_backing_best_fit(wmem_backing_shared_t *shared, uint64_t want)
 {
-    GHashTableIter iter;
-    void          *key, *value;
-    uint8_t       *best = NULL;
-    size_t         best_size = 0;
+    unsigned best = shared->region_count;
+    unsigned i;
 
-    /* Best fit, so that a long run of free space is left for the request
-     * that needs all of it. The number of free regions stays small because
-     * neighbours are merged as they are freed. */
-    g_hash_table_iter_init(&iter, backing->free_starts);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        size_t size = GPOINTER_TO_SIZE(value);
-
-        if (size < want) {
+    for (i = 0; i < shared->region_count; i++) {
+        if (shared->regions[i].used || shared->regions[i].size < want) {
             continue;
         }
-        if (best == NULL || size < best_size) {
-            best      = (uint8_t *)key;
-            best_size = size;
+        if (best == shared->region_count ||
+                shared->regions[i].size < shared->regions[best].size) {
+            best = i;
         }
-        if (size == want) {
+        if (shared->regions[i].size == want) {
             break;
         }
     }
 
-    *found = best_size;
     return best;
 }
 
-/* Hand out a region from the file. */
+/* Hand out a region of the file. The lock is taken once per
+ * multi-megabyte region, so what it costs does not show up anywhere. */
 static void *
 wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
 {
-    uint8_t *best;
-    size_t   best_size;
-    uint8_t *ptr;
+    wmem_backing_shared_t *shared = backing->shared;
+    unsigned               best;
+    void                  *ptr;
 
-    best = wmem_backing_best_fit(backing, want, &best_size);
-    if (best == NULL) {
-        /* Nothing mapped can hold it, so map more. The reserved size is
-         * the growth step as well as the starting size, and a request
-         * larger than that gets a mapping of its own. */
-        uint64_t size = backing->grow > want ? backing->grow : want;
+    pthread_mutex_lock(&shared->lock);
+
+    best = wmem_backing_best_fit(shared, want);
+    if (best == shared->region_count) {
+        /* Nothing mapped can hold it, so add more file. The reserved
+         * size is the growth step as well as the starting size, and a
+         * request larger than that gets a piece of its own. */
+        uint64_t size = shared->grow > want ? shared->grow : want;
         char    *err  = NULL;
 
         if (!wmem_backing_map_segment(backing, size, &err)) {
+            pthread_mutex_unlock(&shared->lock);
             ws_error("wmem: can't grow disk-backed memory past %" PRIu64
-                    " MB: %s", backing->reserve / (1024 * 1024), err);
+                    " MB: %s", shared->reserve / (1024 * 1024), err);
         }
 
-        best = wmem_backing_best_fit(backing, want, &best_size);
-        ws_assert(best != NULL);
+        best = wmem_backing_best_fit(shared, want);
+        ws_assert(best != shared->region_count);
     }
 
-    wmem_backing_free_take(backing, best, best_size);
-    if (best_size > want) {
-        /* The tail is page-aligned, so it is a region in its own right. */
-        wmem_backing_free_add(backing, best + want, best_size - want);
+    if (shared->regions[best].size > want) {
+        /* The tail is page-aligned, so it is a region in its own
+         * right. */
+        wmem_backing_region_insert(shared, best + 1,
+                shared->regions[best].offset + want,
+                shared->regions[best].size - want,
+                shared->regions[best].segment, 0);
+        shared->regions[best].size = want;
     }
-    ptr = best;
+    shared->regions[best].used = 1;
 
-    g_hash_table_insert(backing->sizes, ptr, GSIZE_TO_POINTER(want));
-
-    backing->live += want;
-    if (backing->live > backing->high_water) {
-        backing->high_water = backing->live;
+    shared->live += want;
+    if (shared->live > shared->high_water) {
+        shared->high_water = shared->live;
     }
+
+    ptr = wmem_backing_address(backing, &shared->regions[best]);
+
+    pthread_mutex_unlock(&shared->lock);
 
     return ptr;
 }
@@ -379,20 +475,29 @@ wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
 void *
 wmem_backing_alloc(wmem_backing_t *backing, size_t size)
 {
-    size_t want;
-    void  *ptr;
+    wmem_backing_shared_t *shared = backing->shared;
+    size_t                 want;
+    void                  *ptr = NULL;
 
     want = (size_t)wmem_backing_round_up(size, backing->pagesize);
 
-    /* Below the watermark the memory is ordinary heap memory, so a capture
-     * whose state fits in RAM runs exactly as it would without a store. */
-    if (backing->heap_live + want <= backing->threshold) {
+    /* Below the watermark the memory is ordinary heap memory, so a
+     * capture whose state fits in RAM runs exactly as it would without a
+     * store. The memory is this process's own; the budget is shared, so
+     * one process holding a great deal of state leaves less for the
+     * others rather than each getting its own allowance. */
+    pthread_mutex_lock(&shared->lock);
+    if (shared->heap_live + want <= shared->threshold) {
         ptr = g_malloc(want);
-        g_hash_table_insert(backing->heap_sizes, ptr, GSIZE_TO_POINTER(want));
-        backing->heap_live += want;
-        if (backing->heap_live > backing->heap_high_water) {
-            backing->heap_high_water = backing->heap_live;
+        shared->heap_live += want;
+        if (shared->heap_live > shared->heap_high_water) {
+            shared->heap_high_water = shared->heap_live;
         }
+    }
+    pthread_mutex_unlock(&shared->lock);
+
+    if (ptr != NULL) {
+        g_hash_table_insert(backing->heap_sizes, ptr, GSIZE_TO_POINTER(want));
         return ptr;
     }
 
@@ -402,65 +507,62 @@ wmem_backing_alloc(wmem_backing_t *backing, size_t size)
 void
 wmem_backing_free(wmem_backing_t *backing, void *ptr)
 {
-    const wmem_backing_segment_t *segment;
-    uint8_t *start, *next, *prev;
-    size_t   size, neighbour;
-    void    *value;
+    wmem_backing_shared_t *shared = backing->shared;
+    unsigned               at;
+    uint64_t               offset, size;
+    size_t                 heap_size;
 
     if (ptr == NULL) {
         return;
     }
 
-    size = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->heap_sizes, ptr));
-    if (size != 0) {
+    heap_size = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->heap_sizes,
+                ptr));
+    if (heap_size != 0) {
         g_hash_table_remove(backing->heap_sizes, ptr);
-        backing->heap_live -= size;
+        pthread_mutex_lock(&shared->lock);
+        shared->heap_live -= heap_size;
+        pthread_mutex_unlock(&shared->lock);
         g_free(ptr);
         return;
     }
 
-    size = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->sizes, ptr));
-    ws_assert(size != 0);
-    g_hash_table_remove(backing->sizes, ptr);
+    pthread_mutex_lock(&shared->lock);
 
-    backing->live -= size;
+    at     = wmem_backing_region_of(backing, ptr);
+    offset = shared->regions[at].offset;
+    size   = shared->regions[at].size;
 
-    wmem_backing_release(backing, ptr, size);
+    shared->regions[at].used = 0;
+    shared->live -= size;
 
-    /* Merge with the free region that ends where this one starts, and with
-     * the one that starts where it ends, so that the space goes back as one
-     * extent rather than as a size that may never be asked for again.
-     * Mappings are independent of each other, so a merge must stay inside
-     * the one this region came from even where two of them abut. */
-    start   = (uint8_t *)ptr;
-    segment = wmem_backing_segment_of(backing, start);
+    wmem_backing_release(backing, ptr, offset, (size_t)size);
 
-    prev = (uint8_t *)g_hash_table_lookup(backing->free_ends, start);
-    if (prev != NULL && prev >= segment->base) {
-        neighbour = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->free_starts,
-                    prev));
-        wmem_backing_free_take(backing, prev, neighbour);
-        start = prev;
-        size += neighbour;
+    /* Merge with the region before and the region after, so that the
+     * space goes back as one extent rather than as a size that may never
+     * be asked for again. Pieces of the file are independent of each
+     * other, so a merge stays inside the one this region came from. */
+    if (at + 1 < shared->region_count && !shared->regions[at + 1].used &&
+            shared->regions[at + 1].segment == shared->regions[at].segment) {
+        shared->regions[at].size += shared->regions[at + 1].size;
+        wmem_backing_region_remove(shared, at + 1);
+    }
+    if (at > 0 && !shared->regions[at - 1].used &&
+            shared->regions[at - 1].segment == shared->regions[at].segment) {
+        shared->regions[at - 1].size += shared->regions[at].size;
+        wmem_backing_region_remove(shared, at);
     }
 
-    next = start + size;
-    if (next < segment->base + segment->size &&
-            g_hash_table_lookup_extended(backing->free_starts, next, NULL,
-                &value)) {
-        neighbour = GPOINTER_TO_SIZE(value);
-        wmem_backing_free_take(backing, next, neighbour);
-        size += neighbour;
-    }
-
-    wmem_backing_free_add(backing, start, size);
+    pthread_mutex_unlock(&shared->lock);
 }
 
 void *
 wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
 {
-    size_t old, want;
-    void  *new_ptr;
+    wmem_backing_shared_t *shared = backing->shared;
+    size_t                 old, want;
+    void                  *new_ptr;
+    bool                   keep_in_heap = false;
 
     if (ptr == NULL) {
         return wmem_backing_alloc(backing, size);
@@ -472,15 +574,21 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
     if (old != 0) {
         /* Still in RAM. Keep it there if it fits under the watermark,
          * otherwise this is where it moves to the file. */
-        if (backing->heap_live - old + want <= backing->threshold) {
+        pthread_mutex_lock(&shared->lock);
+        if (shared->heap_live - old + want <= shared->threshold) {
+            shared->heap_live += want - old;
+            if (shared->heap_live > shared->heap_high_water) {
+                shared->heap_high_water = shared->heap_live;
+            }
+            keep_in_heap = true;
+        }
+        pthread_mutex_unlock(&shared->lock);
+
+        if (keep_in_heap) {
             new_ptr = g_realloc(ptr, want);
             g_hash_table_remove(backing->heap_sizes, ptr);
             g_hash_table_insert(backing->heap_sizes, new_ptr,
                     GSIZE_TO_POINTER(want));
-            backing->heap_live += want - old;
-            if (backing->heap_live > backing->heap_high_water) {
-                backing->heap_high_water = backing->heap_live;
-            }
             return new_ptr;
         }
 
@@ -490,21 +598,28 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
         return new_ptr;
     }
 
-    old = GPOINTER_TO_SIZE(g_hash_table_lookup(backing->sizes, ptr));
-    ws_assert(old != 0);
+    pthread_mutex_lock(&shared->lock);
+    old = (size_t)shared->regions[wmem_backing_region_of(backing, ptr)].size;
+    pthread_mutex_unlock(&shared->lock);
 
     if (want == old) {
         return ptr;
     }
 
     if (want < old) {
-        /* Shrinking: keep the head where it is and return the tail, which is
-         * page-aligned and therefore a valid region in its own right. */
-        void *tail = (uint8_t *)ptr + want;
+        /* Shrinking: keep the head where it is and give back the tail,
+         * which is page-aligned and so a region in its own right. */
+        unsigned at;
 
-        g_hash_table_insert(backing->sizes, ptr, GSIZE_TO_POINTER(want));
-        g_hash_table_insert(backing->sizes, tail, GSIZE_TO_POINTER(old - want));
-        wmem_backing_free(backing, tail);
+        pthread_mutex_lock(&shared->lock);
+        at = wmem_backing_region_of(backing, ptr);
+        wmem_backing_region_insert(shared, at + 1,
+                shared->regions[at].offset + want, old - want,
+                shared->regions[at].segment, 1);
+        shared->regions[at].size = want;
+        pthread_mutex_unlock(&shared->lock);
+
+        wmem_backing_free(backing, (uint8_t *)ptr + want);
         return ptr;
     }
 
@@ -518,31 +633,31 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
 uint64_t
 wmem_backing_bytes_live(const wmem_backing_t *backing)
 {
-    return backing->live;
+    return backing->shared->live;
 }
 
 uint64_t
 wmem_backing_bytes_high_water(const wmem_backing_t *backing)
 {
-    return backing->high_water;
+    return backing->shared->high_water;
 }
 
 uint64_t
 wmem_backing_bytes_reserved(const wmem_backing_t *backing)
 {
-    return backing->reserve;
+    return backing->shared->reserve;
 }
 
 uint64_t
 wmem_backing_bytes_in_ram(const wmem_backing_t *backing)
 {
-    return backing->heap_high_water;
+    return backing->shared->heap_high_water;
 }
 
 uint64_t
 wmem_backing_threshold(const wmem_backing_t *backing)
 {
-    return backing->threshold;
+    return backing->shared->threshold;
 }
 
 const char *
