@@ -280,8 +280,8 @@ ws_clock_get_realtime(struct timespec *ts)
 #endif
 }
 
-struct tm *
-ws_localtime_r(const time_t *timep, struct tm *result)
+static struct tm *
+ws_localtime_r_uncached(const time_t *timep, struct tm *result)
 {
 #if defined(HAVE_LOCALTIME_R)
 	return localtime_r(timep, result);
@@ -299,10 +299,101 @@ ws_localtime_r(const time_t *timep, struct tm *result)
 #endif
 }
 
+#ifdef HAVE_STRUCT_TM_TM_ZONE
+/*
+ * The offset from UTC changes only where a zone has a transition, so
+ * for anything inside a window that has been checked for one, the
+ * conversion is arithmetic on a UTC breakdown rather than a trip
+ * through the C library.
+ *
+ * That trip is not always cheap. On macOS a process that has forked
+ * reloads the timezone file on every single call - 36 us a call,
+ * against 0.14 us in the process it forked from - which is most of what
+ * a sharded TShark worker printing a time for every packet spends its
+ * time on.
+ *
+ * The window is fifteen minutes because that is the granularity zones
+ * are defined at; both of its ends are checked, so a transition inside
+ * one would have to be a pair of them less than fifteen minutes apart,
+ * which no zone in the database has ever had.
+ */
+#define WS_TZ_WINDOW	900
+
+static bool        have_window;
+static time_t      window_start, window_end;
+static long        window_gmtoff;
+static int         window_isdst;
+static const char *window_zone;
+
+struct tm *
+ws_localtime_r(const time_t *timep, struct tm *result)
+{
+	time_t shifted;
+
+	if (!have_window || *timep < window_start || *timep >= window_end) {
+		struct tm first, last;
+		time_t    start, end, into;
+
+		into = *timep % WS_TZ_WINDOW;
+		if (into < 0) {
+			/* Before 1970, where the remainder is negative. */
+			into += WS_TZ_WINDOW;
+		}
+		start = *timep - into;
+		end   = start + WS_TZ_WINDOW;
+
+		if (ws_localtime_r_uncached(&start, &first) == NULL) {
+			return ws_localtime_r_uncached(timep, result);
+		}
+		end--;
+		if (ws_localtime_r_uncached(&end, &last) == NULL) {
+			return ws_localtime_r_uncached(timep, result);
+		}
+		end++;
+
+		if (first.tm_gmtoff != last.tm_gmtoff ||
+				first.tm_isdst != last.tm_isdst) {
+			/* A transition in this window: let the library work
+			 * out which side of it this timestamp falls on. */
+			return ws_localtime_r_uncached(timep, result);
+		}
+
+		window_start  = start;
+		window_end    = end;
+		window_gmtoff = first.tm_gmtoff;
+		window_isdst  = first.tm_isdst;
+		window_zone   = first.tm_zone;
+		have_window   = true;
+	}
+
+	shifted = *timep + window_gmtoff;
+	if (ws_gmtime_r(&shifted, result) == NULL) {
+		return NULL;
+	}
+
+	result->tm_gmtoff = window_gmtoff;
+	result->tm_isdst  = window_isdst;
+	result->tm_zone   = (char *)window_zone;
+
+	return result;
+}
+#else /* HAVE_STRUCT_TM_TM_ZONE */
+struct tm *
+ws_localtime_r(const time_t *timep, struct tm *result)
+{
+	return ws_localtime_r_uncached(timep, result);
+}
+#endif /* HAVE_STRUCT_TM_TM_ZONE */
+
 void ws_tzset(void)
 {
 #ifdef HAVE_TZSET
 	tzset();
+#endif
+#ifdef HAVE_STRUCT_TM_TM_ZONE
+	/* Whatever offset was worked out was worked out for the zone that
+	 * has just been changed. */
+	have_window = false;
 #endif
 }
 

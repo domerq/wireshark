@@ -989,6 +989,76 @@ void test_nstime_from_iso8601(void)
     g_assert_cmpint(result.nsecs, ==, expect.nsecs);
 }
 
+/* ws_localtime_r() answers from a cached UTC offset where it can, so it
+ * has to agree with the C library everywhere, and in particular either
+ * side of a transition. The zones are the awkward ones: half-hour and
+ * three-quarter-hour offsets, a half-hour DST step, DST in the southern
+ * hemisphere, and one with no DST at all. */
+static void test_localtime_matches_libc(void)
+{
+    static const char *zones[] = {
+        "UTC",
+        "America/New_York",
+        "Europe/Dublin",
+        "America/St_Johns",     /* -03:30, with DST */
+        "Asia/Kathmandu",       /* +05:45, no DST */
+        "Pacific/Chatham",      /* +12:45, with DST */
+        "Australia/Lord_Howe",  /* +10:30, a 30 minute DST step */
+    };
+    const char *tz_before = g_getenv("TZ");
+    char       *saved     = tz_before != NULL ? g_strdup(tz_before) : NULL;
+
+    for (unsigned z = 0; z < G_N_ELEMENTS(zones); z++) {
+        /* Three years at seven minute steps, which lands on both sides
+         * of every transition in them, and a day in 1943 and one in
+         * 2038 for the offsets that only history and the far future
+         * have. */
+        static const time_t spans[][2] = {
+            { 1425600000, 1425600000 + 3 * 365 * 24 * 3600 },
+            { -848000000, -848000000 + 24 * 3600 },
+            { 2140000000, 2140000000 + 24 * 3600 },
+        };
+
+        g_setenv("TZ", zones[z], true);
+        ws_tzset();
+
+        for (unsigned s = 0; s < G_N_ELEMENTS(spans); s++) {
+            for (time_t t = spans[s][0]; t < spans[s][1]; t += 7 * 60) {
+                struct tm cached, libc;
+
+                g_assert_nonnull(ws_localtime_r(&t, &cached));
+                g_assert_nonnull(localtime_r(&t, &libc));
+
+                g_assert_cmpint(cached.tm_year, ==, libc.tm_year);
+                g_assert_cmpint(cached.tm_mon,  ==, libc.tm_mon);
+                g_assert_cmpint(cached.tm_mday, ==, libc.tm_mday);
+                g_assert_cmpint(cached.tm_hour, ==, libc.tm_hour);
+                g_assert_cmpint(cached.tm_min,  ==, libc.tm_min);
+                g_assert_cmpint(cached.tm_sec,  ==, libc.tm_sec);
+                g_assert_cmpint(cached.tm_wday, ==, libc.tm_wday);
+                g_assert_cmpint(cached.tm_yday, ==, libc.tm_yday);
+#ifdef HAVE_STRUCT_TM_TM_ZONE
+                g_assert_cmpint(cached.tm_gmtoff, ==, libc.tm_gmtoff);
+                g_assert_cmpstr(cached.tm_zone,  ==, libc.tm_zone);
+#endif
+                /* tm_isdst is a flag, not a count: only its sense
+                 * has to match. */
+                g_assert_true((cached.tm_isdst > 0) ==
+                        (libc.tm_isdst > 0));
+            }
+        }
+    }
+
+    if (saved != NULL) {
+        g_setenv("TZ", saved, true);
+        g_free(saved);
+    }
+    else {
+        g_unsetenv("TZ");
+    }
+    ws_tzset();
+}
+
 #include "ws_getopt.h"
 
 #define ARGV_MAX 31
@@ -2205,6 +2275,7 @@ int main(int argc, char **argv)
     g_test_add_func("/to_str/ip_addr_to_str_test1", test_ip_addr_to_str_test1);
 
     g_test_add_func("/nstime/from_iso8601", test_nstime_from_iso8601);
+    g_test_add_func("/time_util/localtime", test_localtime_matches_libc);
 
     g_test_add_func("/ws_getopt/basic1", test_getopt_long_basic1);
     g_test_add_func("/ws_getopt/basic2", test_getopt_long_basic2);
