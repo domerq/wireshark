@@ -195,6 +195,7 @@ static flow_shard_plan_t *jobs_plan;
 static unsigned jobs_shard;
 static FILE *jobs_index_fp;
 static unsigned jobs_pass;
+static bool jobs_worker;
 static bool stats_requested;
 /* The first -z argument whose accumulators the parent cannot fold back
  * together, if there is one. */
@@ -426,6 +427,22 @@ print_shard_plan(const char *filename, unsigned shards)
     flow_shard_plan_free(plan);
 
     return EXIT_SUCCESS;
+}
+
+/* One store serves the whole run, so it is reported once, by whoever
+ * created it rather than by the workers that allocated from it. */
+static void
+capture_backing_report(void)
+{
+    if (capture_backing == NULL || jobs_worker) {
+        return;
+    }
+
+    fprintf(stderr, "dissection state: %" PRIu64 " MB peak in RAM, "
+            "%" PRIu64 " MB peak spilled to %s\n",
+            wmem_backing_bytes_in_ram(capture_backing) / (1024 * 1024),
+            wmem_backing_bytes_high_water(capture_backing) / (1024 * 1024),
+            wmem_backing_path(capture_backing));
 }
 
 #ifndef _WIN32
@@ -1085,7 +1102,7 @@ jobs_merge_stats(jobs_worker_t *workers, unsigned count)
 
 /* Worker side of starting a pass: take over the spools. */
 static void
-jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
+jobs_worker_start(jobs_worker_t *worker, unsigned shard,
         unsigned pass)
 {
     jobs_shard = shard;
@@ -1168,23 +1185,16 @@ jobs_worker_start(jobs_worker_t *worker, unsigned shard, unsigned count,
         }
     }
 
-    if (spill_dir != NULL) {
-        char *spill_err;
-
-        /* A store is a set of mappings that one process hands out
-         * addresses from, so each worker needs its own. The watermark is
-         * what the run as a whole may keep in RAM, so it is divided
-         * between them; the reserve is address space, which costs
-         * nothing until it is used. */
-        capture_backing = wmem_backing_file_new(spill_dir, spill_reserve,
-                spill_after / count, &spill_err);
-        if (capture_backing == NULL) {
-            cmdarg_err("Worker %u can't spill to \"%s\": %s", shard,
-                    spill_dir, spill_err);
-            exit(WS_EXIT_INVALID_OPTION);
-        }
+    /* The store was created before the fork, so this worker shares it
+     * with its siblings rather than keeping a store of its own: one
+     * file, one watermark, and whichever worker needs the memory gets
+     * it. Installing it here rather than before the fork leaves the
+     * state that already existed private to each worker. */
+    if (capture_backing != NULL) {
         wmem_set_capture_backing(capture_backing);
     }
+
+    jobs_worker = true;
 }
 
 /*
@@ -1211,7 +1221,7 @@ jobs_run_pass(jobs_worker_t *workers, unsigned count, unsigned pass,
             return false;
         }
         if (pid == 0) {
-            jobs_worker_start(&workers[i], i, count, pass);
+            jobs_worker_start(&workers[i], i, pass);
             return true;
         }
         workers[i].pid = pid;
@@ -2500,7 +2510,7 @@ main(int argc, char *argv[])
     application_file_extensions(&file_extensions, &num_extensions);
     wtap_init(true, application_configuration_environment_prefix(), file_extensions, num_extensions);
 
-    if (spill_dir != NULL && jobs <= 1) {
+    if (spill_dir != NULL) {
         char *spill_err;
 
         capture_backing = wmem_backing_file_new(spill_dir, spill_reserve,
@@ -2512,11 +2522,17 @@ main(int argc, char *argv[])
             exit_status = WS_EXIT_INVALID_OPTION;
             goto clean_exit;
         }
-        /* Must happen before epan_init() creates the scopes. With --jobs
-         * the store is created in each worker instead, because a mapping
-         * that two processes allocate from independently is not a store
-         * they can share. */
-        wmem_set_capture_backing(capture_backing);
+        /* The store is created here, before the fork, so that every
+         * worker allocates from the same one: one file, one watermark,
+         * and whichever worker needs the memory gets it.
+         *
+         * Workers install it themselves once they exist. State
+         * allocated before the fork would otherwise sit in memory they
+         * all share and all write to, where private copies are what
+         * each of them needs. */
+        if (jobs <= 1) {
+            wmem_set_capture_backing(capture_backing);
+        }
     }
 
     /* Register all dissectors; we must do this before checking for the
@@ -3878,6 +3894,12 @@ main(int argc, char *argv[])
                     print_details || output_action != WRITE_TEXT ||
                     dfcode != NULL,
                     (int *)&exit_status)) {
+            /* The parent, with every worker finished: it never
+             * dissected anything itself, so this is where the run's
+             * store is reported and released. */
+            capture_backing_report();
+            wmem_backing_destroy(capture_backing);
+            capture_backing = NULL;
             goto clean_exit;
         }
         /* A worker: carry on and read the file, printing the packets this
@@ -4238,13 +4260,7 @@ main(int argc, char *argv[])
         }
     }
 
-    if (capture_backing != NULL) {
-        fprintf(stderr, "dissection state: %" PRIu64 " MB peak in RAM, "
-                "%" PRIu64 " MB peak spilled to %s\n",
-                wmem_backing_bytes_in_ram(capture_backing) / (1024 * 1024),
-                wmem_backing_bytes_high_water(capture_backing) / (1024 * 1024),
-                wmem_backing_path(capture_backing));
-    }
+    capture_backing_report();
 
     /* Memory cleanup */
     reset_tap_listeners();
