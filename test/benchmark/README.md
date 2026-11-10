@@ -4,6 +4,136 @@ Tools for measuring how dissection state scales, and for reproducing the
 numbers in `doc/README.memory-spill`. Nothing here runs as part of the test
 suite; the captures are large and the runs take minutes.
 
+## Quick check
+
+The measurements below need multi-gigabyte captures and take minutes. This
+section does not: a synthetic capture with enough flows to exceed a small
+memory limit runs in about two seconds, which is enough to show that a run
+dies without spilling, survives with it, and produces the same bytes either
+way.
+
+    test/benchmark/gen_pcap.py -c 300000 -f 150000 /tmp/quick.pcap
+    # 26 MB on disk, ~700 MB of dissection state under -z conv,tcp
+    # (everything below runs from the source root)
+
+### macOS: a malloc budget
+
+The interposer makes the limit deterministic, and counts only heap, which is
+the whole point of the option. Build it once:
+
+    cc -dynamiclib -O2 -o /tmp/memcap.dylib test/benchmark/memcap.c
+    export DYLD_INSERT_LIBRARIES=/tmp/memcap.dylib
+
+With no budget it reports what the run needs, and gives the reference output:
+
+    build/run/tshark -r /tmp/quick.pcap -q -z conv,tcp > /tmp/ref.out
+    # memcap: peak heap 796 MB, live at exit 0 MB
+
+Then impose less than that:
+
+    export MEMCAP_BYTES=$((512 * 1024 * 1024))
+
+    build/run/tshark -r /tmp/quick.pcap -q -z conv,tcp
+    # GLib ERROR failed to allocate 8388608 bytes - Aborting (0.4 s, no output)
+
+    build/run/tshark -r /tmp/quick.pcap --spill-dir /tmp/spill -q -z conv,tcp
+    # same abort: the default 2048 MB watermark is above the 512 MB budget
+
+    build/run/tshark -r /tmp/quick.pcap --spill-dir /tmp/spill \
+        --spill-after 256 -q -z conv,tcp > /tmp/spilled.out
+    # dissection state: 256 MB peak in RAM, 448 MB peak spilled
+    # memcap: peak heap 348 MB, live at exit 0 MB (1.5 s)
+    cmp /tmp/ref.out /tmp/spilled.out
+
+The middle run is the trap described in `doc/README.memory-spill` section 9:
+the watermark has to be set below whatever limit is being imposed.
+
+### Linux: a cgroup limit
+
+A real limit, no shim. The container below is the one the Dockerfile builds
+(see further down for the build; it is a one-off), and `wswork` is a volume
+holding the capture, so the spill file is written to a real filesystem:
+
+    docker volume create wswork
+    docker run --rm -v "$PWD/caps:/caps:ro" -v wswork:/work \
+        wireshark-bench cp /caps/quick.pcap /work/
+
+    R="docker run --rm -v wsbuild:/build -v wswork:/work"
+
+    $R wireshark-bench /build/run/tshark -r /work/quick.pcap \
+        -q -z conv,tcp > /work/ref.out
+    # 1.55 s, maximum resident set size 919 MB
+
+    $R --memory=512m wireshark-bench /build/run/tshark -r /work/quick.pcap \
+        -q -z conv,tcp
+    # Killed (exit 137), nothing produced
+
+    $R --memory=512m wireshark-bench /build/run/tshark -r /work/quick.pcap \
+        --spill-dir /work -q -z conv,tcp
+    # Killed the same way: the default 2048 MB watermark is above the limit
+
+    $R --memory=512m wireshark-bench sh -c '/build/run/tshark \
+        -r /work/quick.pcap --spill-dir /work --spill-after 256 \
+        -q -z conv,tcp > /work/spilled.out; cmp /work/ref.out /work/spilled.out'
+    # dissection state: 256 MB peak in RAM, 448 MB peak spilled (4.4 s)
+
+Outside Docker the same limit is one command:
+
+    systemd-run --user --scope -p MemoryMax=512M \
+        build/run/tshark -r /tmp/quick.pcap --spill-dir /tmp/spill \
+            --spill-after 256 -q -z conv,tcp
+
+`ulimit -v` is the wrong tool for this and will not measure what it looks
+like it measures: it caps address space, and the store deliberately maps far
+more of that than it uses, so the run dies in the mapping rather than at the
+limit being demonstrated:
+
+    ulimit -v 524288
+    build/run/tshark -r /work/quick.pcap --spill-dir /work --spill-after 256 ...
+    # wmem_backing_base(): wmem: can't map 68719476736 bytes of the backing
+    # file: Cannot allocate memory
+
+Lowering `--spill-reserve` does not rescue it either, because the limit
+applies to the mapping whatever its size. Use a cgroup.
+
+### The GUI
+
+Wireshark takes the same three options. Without a display, the offscreen
+platform plugin loads a capture and can be measured the same way; the GUI has
+no equivalent of TShark's report at exit, so the figure comes from vmmap:
+
+    QT_QPA_PLATFORM=offscreen \
+        build/run/Wireshark.app/Contents/MacOS/Wireshark -r /tmp/quick.pcap &
+    vmmap -summary $! | grep -E 'Physical footprint|mapped file|^TOTAL'
+    # Physical footprint 854.7M, of which 822.6M dirty malloc
+
+    QT_QPA_PLATFORM=offscreen \
+        build/run/Wireshark.app/Contents/MacOS/Wireshark -r /tmp/quick.pcap \
+            --spill-dir /tmp/spill --spill-after 0 &
+    vmmap -summary $! | grep -E 'Physical footprint|mapped file|^TOTAL'
+    # Physical footprint 158.0M, 120.4M dirty malloc, 712.7M resident file pages
+
+The state did not disappear - it moved to pages the kernel can evict without
+swap, which is why footprint falls by 697 MB while the mapped file grows by
+about as much. The equivalent reading on Linux is RssAnon against RssFile in
+/proc/<pid>/status; the numbers above are macOS.
+
+### Sharding, in the same two seconds
+
+    build/run/tshark -r /tmp/quick.pcap --shard-plan 4
+    # 300000 packets, 150000 address pairs, 0 with no IP pair
+    #   shard 0:     75000 packets (1.00x ideal)   ... x4
+
+    build/run/tshark -r /tmp/quick.pcap > /tmp/s1.out              # 1.3 s
+    build/run/tshark -r /tmp/quick.pcap --jobs 4 > /tmp/s4.out     # 0.6 s
+    cmp /tmp/s1.out /tmp/s4.out
+
+The option combination is covered by the test suite, which needs no capture
+of its own:
+
+    pytest test/suite_clopts.py -k 'shard or jobs or spill' \
+        --program-path build/run
+
 ## gen_pcap.py
 
 Synthetic TCP captures with an exact packet and flow count, which is what

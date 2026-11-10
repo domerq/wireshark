@@ -296,4 +296,6 @@ in progress.
 test/benchmark/gen_pcap.py generates captures with an exact packet and
 flow count; test/benchmark/flow_split.py splits a real capture into
 flow-disjoint files, which is what the measurements that predate --jobs
-used. See test/benchmark/README.md.
+used. See test/benchmark/README.md, whose first section runs --shard-plan
+and --jobs against a synthetic capture in a couple of seconds and checks
+the sharded output against the serial one.

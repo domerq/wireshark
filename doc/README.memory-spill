@@ -316,4 +316,7 @@ watermark below the limit it is imposing.
 test/benchmark contains the capture generators, the malloc-budget interposer
 and a Dockerfile for the Linux side, including the demonstrations that an
 unmodified run dies where a spilled run completes with identical output.
-See test/benchmark/README.md.
+See test/benchmark/README.md, whose first section is a two-second version of
+that demonstration - for TShark and for the GUI, under a malloc budget on
+macOS and a cgroup limit on Linux - on a synthetic capture rather than the
+multi-gigabyte ones the numbers above come from.
