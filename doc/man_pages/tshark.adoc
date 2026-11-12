@@ -2475,6 +2475,10 @@ directory listing and is reclaimed even if *TShark* is killed.
 
 Unlike *-M*, no state is discarded, so results are identical to a run that
 keeps everything in memory, and two-pass analysis (*-2*) is supported.
+
+The store is built on POSIX shared file mappings, so this option is not
+available on Windows, where it fails with an error instead of running
+without it.
 --
 
 --spill-after <size>::

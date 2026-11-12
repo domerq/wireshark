@@ -227,6 +227,17 @@ sub-arena, so a cold flow's state is page-contiguous and faults back as one
 unit; that also makes explicit LRU eviction of idle flows possible, which
 would subsume -M without discarding anything that is still reachable.
 
+Platforms. The store needs mmap() of a sparse file, a mapping shared
+across fork(), and a process-shared mutex, so it is POSIX-only;
+wmem_backing_file_new() fails on Windows and --spill-dir reports that
+and exits rather than silently running without it. Porting it means a
+second implementation on CreateFileMapping()/MapViewOfFile() with
+FSCTL_SET_ZERO_DATA for the holes, and, since there is no fork(), a
+named mapping plus a named mutex inherited by re-executed workers
+before --jobs could share one store there. Hole punching is already
+per-platform (F_PUNCHHOLE on macOS, FALLOC_FL_PUNCH_HOLE on Linux,
+and a filesystem that cannot do it just keeps the blocks).
+
 Flow sharding attacks the same locality problem from the other side, by
 making each process's arena smaller, and --jobs now does it: see
 README.flow-sharding. The store is created before the workers are

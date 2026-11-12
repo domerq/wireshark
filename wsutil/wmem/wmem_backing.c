@@ -38,6 +38,23 @@
 #endif
 
 /*
+ * The lock is held by processes that forked after the store was created,
+ * so on POSIX it is a process-shared mutex living in the shared mapping.
+ * Windows has neither that mapping nor fork(), so no store is ever
+ * created there - wmem_backing_file_new() fails - and the lock exists
+ * only so that the code below still compiles.
+ */
+#ifdef _WIN32
+typedef char wmem_backing_lock_t;
+#define wmem_backing_lock(l)   ((void)(l))
+#define wmem_backing_unlock(l) ((void)(l))
+#else
+typedef pthread_mutex_t wmem_backing_lock_t;
+#define wmem_backing_lock(l)   pthread_mutex_lock(l)
+#define wmem_backing_unlock(l) pthread_mutex_unlock(l)
+#endif
+
+/*
  * Everything the store knows about which bytes are handed out lives in a
  * shared anonymous mapping, in file offsets rather than addresses, and
  * behind a lock that works between processes. A process that forks after
@@ -76,7 +93,7 @@ typedef struct {
 } wmem_backing_region_t;
 
 typedef struct {
-    pthread_mutex_t lock;
+    wmem_backing_lock_t lock;
 
     uint64_t    reserve;   /* total size of the file that is mapped */
     uint64_t    grow;      /* size to add when it is all handed out */
@@ -429,7 +446,7 @@ wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
     unsigned               best;
     void                  *ptr;
 
-    pthread_mutex_lock(&shared->lock);
+    wmem_backing_lock(&shared->lock);
 
     best = wmem_backing_best_fit(shared, want);
     if (best == shared->region_count) {
@@ -440,7 +457,7 @@ wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
         char    *err  = NULL;
 
         if (!wmem_backing_map_segment(backing, size, &err)) {
-            pthread_mutex_unlock(&shared->lock);
+            wmem_backing_unlock(&shared->lock);
             ws_error("wmem: can't grow disk-backed memory past %" PRIu64
                     " MB: %s", shared->reserve / (1024 * 1024), err);
         }
@@ -467,7 +484,7 @@ wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
 
     ptr = wmem_backing_address(backing, &shared->regions[best]);
 
-    pthread_mutex_unlock(&shared->lock);
+    wmem_backing_unlock(&shared->lock);
 
     return ptr;
 }
@@ -486,7 +503,7 @@ wmem_backing_alloc(wmem_backing_t *backing, size_t size)
      * store. The memory is this process's own; the budget is shared, so
      * one process holding a great deal of state leaves less for the
      * others rather than each getting its own allowance. */
-    pthread_mutex_lock(&shared->lock);
+    wmem_backing_lock(&shared->lock);
     if (shared->heap_live + want <= shared->threshold) {
         ptr = g_malloc(want);
         shared->heap_live += want;
@@ -494,7 +511,7 @@ wmem_backing_alloc(wmem_backing_t *backing, size_t size)
             shared->heap_high_water = shared->heap_live;
         }
     }
-    pthread_mutex_unlock(&shared->lock);
+    wmem_backing_unlock(&shared->lock);
 
     if (ptr != NULL) {
         g_hash_table_insert(backing->heap_sizes, ptr, GSIZE_TO_POINTER(want));
@@ -520,9 +537,9 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
                 ptr));
     if (heap_size != 0) {
         g_hash_table_remove(backing->heap_sizes, ptr);
-        pthread_mutex_lock(&shared->lock);
+        wmem_backing_lock(&shared->lock);
         shared->heap_live -= heap_size;
-        pthread_mutex_unlock(&shared->lock);
+        wmem_backing_unlock(&shared->lock);
         g_free(ptr);
         return;
     }
@@ -533,15 +550,15 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
      * syscall would serialize them on it. The region still counts as
      * handed out while this happens, so nothing else can be given the
      * bytes being discarded. */
-    pthread_mutex_lock(&shared->lock);
+    wmem_backing_lock(&shared->lock);
     at     = wmem_backing_region_of(backing, ptr);
     offset = shared->regions[at].offset;
     size   = shared->regions[at].size;
-    pthread_mutex_unlock(&shared->lock);
+    wmem_backing_unlock(&shared->lock);
 
     wmem_backing_release(backing, ptr, offset, (size_t)size);
 
-    pthread_mutex_lock(&shared->lock);
+    wmem_backing_lock(&shared->lock);
 
     at = wmem_backing_region_of(backing, ptr);
     shared->regions[at].used = 0;
@@ -562,7 +579,7 @@ wmem_backing_free(wmem_backing_t *backing, void *ptr)
         wmem_backing_region_remove(shared, at);
     }
 
-    pthread_mutex_unlock(&shared->lock);
+    wmem_backing_unlock(&shared->lock);
 }
 
 void *
@@ -583,7 +600,7 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
     if (old != 0) {
         /* Still in RAM. Keep it there if it fits under the watermark,
          * otherwise this is where it moves to the file. */
-        pthread_mutex_lock(&shared->lock);
+        wmem_backing_lock(&shared->lock);
         if (shared->heap_live - old + want <= shared->threshold) {
             shared->heap_live += want - old;
             if (shared->heap_live > shared->heap_high_water) {
@@ -591,7 +608,7 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
             }
             keep_in_heap = true;
         }
-        pthread_mutex_unlock(&shared->lock);
+        wmem_backing_unlock(&shared->lock);
 
         if (keep_in_heap) {
             new_ptr = g_realloc(ptr, want);
@@ -607,9 +624,9 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
         return new_ptr;
     }
 
-    pthread_mutex_lock(&shared->lock);
+    wmem_backing_lock(&shared->lock);
     old = (size_t)shared->regions[wmem_backing_region_of(backing, ptr)].size;
-    pthread_mutex_unlock(&shared->lock);
+    wmem_backing_unlock(&shared->lock);
 
     if (want == old) {
         return ptr;
@@ -620,13 +637,13 @@ wmem_backing_realloc(wmem_backing_t *backing, void *ptr, size_t size)
          * which is page-aligned and so a region in its own right. */
         unsigned at;
 
-        pthread_mutex_lock(&shared->lock);
+        wmem_backing_lock(&shared->lock);
         at = wmem_backing_region_of(backing, ptr);
         wmem_backing_region_insert(shared, at + 1,
                 shared->regions[at].offset + want, old - want,
                 shared->regions[at].segment, 1);
         shared->regions[at].size = want;
-        pthread_mutex_unlock(&shared->lock);
+        wmem_backing_unlock(&shared->lock);
 
         wmem_backing_free(backing, (uint8_t *)ptr + want);
         return ptr;
