@@ -31,6 +31,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <sys/types.h>
+#include <sys/statvfs.h>
 #ifdef __linux__
 /* FALLOC_FL_PUNCH_HOLE lives here, not in <fcntl.h>. */
 #include <linux/falloc.h>
@@ -327,6 +328,55 @@ wmem_backing_release(wmem_backing_t *backing, void *ptr, uint64_t offset,
 #endif
 }
 
+/* Make sure the file really holds the blocks for a region before
+ * anything writes to it.
+ *
+ * The mapping is sparse, so a filesystem that fills up does not fail an
+ * allocation: the first write to a page that has no block behind it
+ * faults, and the process dies of SIGBUS, unrecoverably and without a
+ * word about why, after however long the capture has been running.
+ * Allocating the blocks up front turns that into an error at the point
+ * the space ran out.
+ *
+ * Returns false with *err set if the space is not there.
+ */
+static bool
+wmem_backing_reserve(wmem_backing_t *backing, uint64_t offset, uint64_t size,
+        char **err)
+{
+#ifdef _WIN32
+    (void)backing; (void)offset; (void)size; (void)err;
+    ws_assert_not_reached();
+#else
+    struct statvfs st;
+
+#ifdef __linux__
+    if (fallocate(backing->fd, 0, (off_t)offset, (off_t)size) == 0) {
+        return true;
+    }
+    if (errno != EOPNOTSUPP && errno != ENOSYS) {
+        *err = g_strdup(g_strerror(errno));
+        return false;
+    }
+    /* The filesystem cannot preallocate, so all that is left is to look
+     * at how much room it says it has. */
+#else
+    (void)offset;
+#endif
+
+    /* Racy by nature - another writer can take the space between this
+     * and the fault - but it catches the case that actually happens,
+     * which is a spill directory that has run out. */
+    if (fstatvfs(backing->fd, &st) == 0 &&
+            (uint64_t)st.f_bavail * (uint64_t)st.f_frsize < size) {
+        *err = g_strdup(g_strerror(ENOSPC));
+        return false;
+    }
+
+    return true;
+#endif /* _WIN32 */
+}
+
 wmem_backing_t *
 wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
         char **err)
@@ -346,14 +396,40 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
     pagesize = (size_t)getpagesize();
     reserve  = wmem_backing_round_up(reserve, pagesize);
 
-    path = g_build_filename(dir != NULL ? dir : g_get_tmp_dir(),
-            "wireshark_wmem_XXXXXX", NULL);
+    if (dir == NULL) {
+        dir = g_get_tmp_dir();
+    }
 
-    fd = g_mkstemp(path);
+    path = NULL;
+    fd   = -1;
+
+#ifdef O_TMPFILE
+    /* A file that never had a name cannot be opened by anything else,
+     * and cannot be left behind by a process that dies between creating
+     * it and unlinking it. Filesystems that do not implement it (NFS,
+     * overlayfs and others) fail the open, which is what the named file
+     * below is for. */
+    fd = open(dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
+    if (fd >= 0) {
+        path = g_strdup_printf("%s (unnamed temporary file)", dir);
+    }
+#endif
+
     if (fd < 0) {
-        *err = g_strdup_printf("can't create %s: %s", path, g_strerror(errno));
-        g_free(path);
-        return NULL;
+        path = g_build_filename(dir, "wireshark_wmem_XXXXXX", NULL);
+
+        fd = g_mkstemp(path);
+        if (fd < 0) {
+            *err = g_strdup_printf("can't create %s: %s", path,
+                    g_strerror(errno));
+            g_free(path);
+            return NULL;
+        }
+
+        /* The fd keeps the file alive, so take the name away at once:
+         * nothing else can then open the capture's state, and nothing
+         * is left in the directory if this process is killed. */
+        g_unlink(path);
     }
 
     /* The bookkeeping goes in a shared anonymous mapping rather than in
@@ -365,7 +441,6 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
         *err = g_strdup_printf("can't map %zu bytes for the backing store: "
                 "%s", sizeof(wmem_backing_shared_t), g_strerror(errno));
         ws_close(fd);
-        g_unlink(path);
         g_free(path);
         return NULL;
     }
@@ -387,15 +462,9 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
     backing->shared->threshold = threshold;
 
     if (!wmem_backing_map_segment(backing, reserve, err)) {
-        g_unlink(path);
         wmem_backing_destroy(backing);
         return NULL;
     }
-
-    /* The mapping keeps the file alive; unlinking now means no leftovers
-     * if we die, and no way for anything else to read the capture
-     * state. */
-    g_unlink(path);
 
     return backing;
 #endif /* _WIN32 */
@@ -491,6 +560,24 @@ wmem_backing_alloc_mapped(wmem_backing_t *backing, size_t want)
                 shared->regions[best].size - want,
                 shared->regions[best].segment, 0);
         shared->regions[best].size = want;
+    }
+
+    {
+        /* Before this region is written to, and while the lock still
+         * says it is nobody's, make the filesystem commit the space for
+         * it. */
+        char *err = NULL;
+
+        if (!wmem_backing_reserve(backing, shared->regions[best].offset,
+                    want, &err)) {
+            uint64_t live = shared->live;
+
+            wmem_backing_unlock(&shared->lock);
+            ws_error("wmem: can't reserve %" PRIu64 " MB for disk-backed "
+                    "memory in %s, with %" PRIu64 " MB of it already in "
+                    "use: %s", (uint64_t)want / (1024 * 1024), backing->path,
+                    live / (1024 * 1024), err);
+        }
     }
     shared->regions[best].used = 1;
 
