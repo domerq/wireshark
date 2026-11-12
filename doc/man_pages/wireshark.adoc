@@ -586,9 +586,10 @@ bytes per packet of Qt data structures, and reading a packet whose state
 has been written out costs a disk read, so scrolling and filtering a
 spilled capture are slower.
 
-The store is built on POSIX shared file mappings, so this option is not
-available on Windows, where it fails with an error instead of starting
-without it.
+On Windows the file keeps a name while it is open, since the system has
+no way to unlink an open file, and is removed when the last handle to it
+closes, including if *Wireshark* is killed. It has to be on a volume that
+supports sparse files.
 --
 
 --spill-after <size>::

@@ -244,16 +244,16 @@ sub-arena, so a cold flow's state is page-contiguous and faults back as one
 unit; that also makes explicit LRU eviction of idle flows possible, which
 would subsume -M without discarding anything that is still reachable.
 
-Platforms. The store needs mmap() of a sparse file, a mapping shared
-across fork(), and a process-shared mutex, so it is POSIX-only;
-wmem_backing_file_new() fails on Windows and --spill-dir reports that
-and exits rather than silently running without it. Porting it means a
-second implementation on CreateFileMapping()/MapViewOfFile() with
-FSCTL_SET_ZERO_DATA for the holes, and, since there is no fork(), a
-named mapping plus a named mutex inherited by re-executed workers
-before --jobs could share one store there. Hole punching is already
-per-platform (F_PUNCHHOLE on macOS, FALLOC_FL_PUNCH_HOLE on Linux,
-and a filesystem that cannot do it just keeps the blocks).
+Platforms. The store runs on POSIX and on Windows, with the same
+bookkeeping over two sets of system calls: mmap() of a sparse file
+against CreateFileMappingW()/MapViewOfFile(), hole punching with
+fcntl(F_PUNCHHOLE) or fallocate(FALLOC_FL_PUNCH_HOLE) against
+FSCTL_SET_ZERO_DATA, and a filesystem that cannot punch just keeps the
+blocks. What Windows does not have is fork(), so its bookkeeping is one
+process's own memory behind an SRW lock rather than a shared mapping
+behind a process-shared mutex, and --jobs - which is itself POSIX-only -
+cannot share a store there. Giving it one would mean a named mapping and
+a named mutex handed to re-executed workers.
 
 Flow sharding attacks the same locality problem from the other side, by
 making each process's arena smaller, and --jobs now does it: see
@@ -304,8 +304,9 @@ fallocate(FALLOC_FL_PUNCH_HOLE); macOS uses fcntl(F_PUNCHHOLE). Note that
 FALLOC_FL_PUNCH_HOLE is declared in <linux/falloc.h>, not <fcntl.h>, and
 fallocate() itself needs _GNU_SOURCE - get either wrong and the hole punching
 silently compiles out while everything still works, just without returning
-disk blocks. Windows has no equivalent of the mapping scheme used here, so
-wmem_backing_file_new() fails there and --spill-dir reports the error.
+disk blocks. Windows punches with FSCTL_SET_ZERO_DATA on a file made
+sparse by FSCTL_SET_SPARSE, and has no counterpart to MADV_DONTNEED for a
+mapped view, so its pages go when the cache manager decides they do.
 
 Both paths are verified: on ext4 the store's file is sparse - 64 GB of
 address space against the few hundred megabytes actually in use - and holding
@@ -327,15 +328,27 @@ is read back. MADV_FREE is for anonymous memory and returns EINVAL here.
 The file is created with O_TMPFILE where the filesystem supports it, so it
 has no name at any point in its life; where it does not - NFS and others -
 it is mkstemp() followed immediately by unlink(), which leaves a window of
-microseconds rather than of the whole mapping step.
+microseconds rather than of the whole mapping step. Windows can do
+neither, so the file is created with FILE_FLAG_DELETE_ON_CLOSE and
+FILE_SHARE_DELETE and keeps a name until the last handle to it goes,
+which is also what removes it when the process dies. It is made sparse
+with FSCTL_SET_SPARSE before anything is written, and a volume that
+refuses that cannot hold a store: the alternative is a real file the size
+of the address range.
 
 The blocks behind a region are allocated before the region is handed out,
-with fallocate() on Linux and a statvfs() check of the free space
-elsewhere. Without that, a sparse mapping over a filesystem that fills up
-does not fail an allocation: the write faults, the process gets SIGBUS and
-there is nothing to report. Filesystems that cannot preallocate (and macOS,
-where the check is all there is) still fault, so the check is a courtesy
-there rather than a guarantee.
+with fallocate() on Linux and a check of the free space elsewhere -
+statvfs() on POSIX, GetDiskFreeSpaceExW() on Windows. Without that, a
+sparse mapping over a filesystem that fills up does not fail an
+allocation: the write faults, and the process dies of SIGBUS, or of
+EXCEPTION_IN_PAGE_ERROR on Windows, with nothing to report. Where the
+blocks cannot be claimed in advance - macOS, Windows, anything without
+fallocate() - the check is a courtesy rather than a guarantee.
+
+The file is sized differently, too. POSIX extends it with ftruncate()
+when a segment is added; on Windows the mapping object extends it, since
+resizing a file that already has views of it is something the system may
+refuse.
 
 Resident set size is a misleading measure on both platforms: resident pages
 of the backing file count towards it even though they are evictable without

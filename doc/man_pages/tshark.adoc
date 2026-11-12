@@ -2481,9 +2481,11 @@ directory rather than failing somewhere in the middle of dissection.
 Unlike *-M*, no state is discarded, so results are identical to a run that
 keeps everything in memory, and two-pass analysis (*-2*) is supported.
 
-The store is built on POSIX shared file mappings, so this option is not
-available on Windows, where it fails with an error instead of running
-without it.
+On Windows the file keeps a name while it is open, since the system has
+no way to unlink an open file, and is removed when the last handle to it
+closes, including if *TShark* is killed. It has to be on a volume that
+supports sparse files. *--jobs* cannot share a store between workers
+there, but it is not available on Windows either.
 --
 
 --spill-after <size>::

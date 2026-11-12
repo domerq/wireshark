@@ -24,7 +24,12 @@
 #include <wsutil/file_util.h>
 #include <wsutil/ws_assert.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#include <winioctl.h>
+#include <wsutil/unicode-utils.h>
+#include <wsutil/win32-utils.h>
+#else
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -39,16 +44,17 @@
 #endif
 
 /*
- * The lock is held by processes that forked after the store was created,
- * so on POSIX it is a process-shared mutex living in the shared mapping.
- * Windows has neither that mapping nor fork(), so no store is ever
- * created there - wmem_backing_file_new() fails - and the lock exists
- * only so that the code below still compiles.
+ * The lock covers the bookkeeping, which on POSIX is shared with every
+ * process forked since the store was created, so it is a process-shared
+ * mutex living in that shared mapping. Windows has no fork(), so the
+ * store there is one process's own and an SRW lock is enough: it still
+ * has to be taken, because TShark's two passes and the GUI's dissection
+ * can both reach the store from more than one thread.
  */
 #ifdef _WIN32
-typedef char wmem_backing_lock_t;
-#define wmem_backing_lock(l)   ((void)(l))
-#define wmem_backing_unlock(l) ((void)(l))
+typedef SRWLOCK wmem_backing_lock_t;
+#define wmem_backing_lock(l)   AcquireSRWLockExclusive(l)
+#define wmem_backing_unlock(l) ReleaseSRWLockExclusive(l)
 #else
 typedef pthread_mutex_t wmem_backing_lock_t;
 #define wmem_backing_lock(l)   pthread_mutex_lock(l)
@@ -56,12 +62,13 @@ typedef pthread_mutex_t wmem_backing_lock_t;
 #endif
 
 /*
- * Everything the store knows about which bytes are handed out lives in a
- * shared anonymous mapping, in file offsets rather than addresses, and
- * behind a lock that works between processes. A process that forks after
- * the store is created therefore allocates from the same store as its
- * parent and its siblings, with one watermark and one set of figures for
- * all of them.
+ * Everything the store knows about which bytes are handed out lives in
+ * file offsets rather than addresses, behind a lock. On POSIX the
+ * bookkeeping is a shared anonymous mapping, so a process that forks
+ * after the store is created allocates from the same store as its
+ * parent and its siblings, with one watermark and one set of figures
+ * for all of them; on Windows, which has no fork(), it is ordinary
+ * memory belonging to the one process that created it.
  *
  * Offsets rather than addresses because nothing dereferences another
  * process's memory: workers keep their own dissection state, so all that
@@ -117,8 +124,16 @@ typedef struct {
 } wmem_backing_shared_t;
 
 struct _wmem_backing_t {
+#ifdef _WIN32
+    HANDLE      file;
+    /* One file mapping object per segment: a mapping object is sized
+     * when it is created, so growing the store means another one. */
+    HANDLE      maps[WMEM_BACKING_MAX_SEGMENTS];
+#else
     int         fd;
+#endif
     char       *path;
+    char       *dir;     /* the directory it was created in */
     size_t      pagesize;
 
     wmem_backing_shared_t *shared;
@@ -144,8 +159,45 @@ static uint8_t *
 wmem_backing_base(wmem_backing_t *backing, unsigned segment)
 {
 #ifdef _WIN32
-    (void)backing; (void)segment;
-    ws_assert_not_reached();
+    uint64_t  offset, size;
+    void     *base;
+
+    if (segment < backing->mapped && backing->bases[segment] != NULL) {
+        return backing->bases[segment];
+    }
+
+    ws_assert(segment < backing->shared->segment_count);
+
+    offset = backing->shared->segments[segment].offset;
+    size   = backing->shared->segments[segment].size;
+
+    /* A mapping object is sized when it is created, so each segment
+     * gets one of its own rather than the whole file getting a new one
+     * every time the store grows. */
+    if (backing->maps[segment] == NULL) {
+        backing->maps[segment] = CreateFileMappingW(backing->file, NULL,
+                PAGE_READWRITE, (DWORD)((offset + size) >> 32),
+                (DWORD)(offset + size), NULL);
+        if (backing->maps[segment] == NULL) {
+            ws_error("wmem: can't create a %" PRIu64 " byte mapping of the "
+                    "backing file: %s", size,
+                    win32strerror(GetLastError()));
+        }
+    }
+
+    base = MapViewOfFile(backing->maps[segment], FILE_MAP_ALL_ACCESS,
+            (DWORD)(offset >> 32), (DWORD)offset, (SIZE_T)size);
+    if (base == NULL) {
+        ws_error("wmem: can't map %" PRIu64 " bytes of the backing file: %s",
+                size, win32strerror(GetLastError()));
+    }
+
+    backing->bases[segment] = (uint8_t *)base;
+    if (segment >= backing->mapped) {
+        backing->mapped = segment + 1;
+    }
+
+    return backing->bases[segment];
 #else
     void *base;
 
@@ -244,16 +296,35 @@ wmem_backing_region_remove(wmem_backing_shared_t *shared, unsigned at)
             (shared->region_count - at) * sizeof(shared->regions[0]));
 }
 
+/* Make the backing file this long. The file is sparse, so this does not
+ * allocate disk blocks; those are claimed per region by
+ * wmem_backing_reserve() as regions are handed out. */
+static bool
+wmem_backing_set_size(wmem_backing_t *backing, uint64_t size, char **err)
+{
+#ifdef _WIN32
+    /* Nothing to do: a mapping object created for a range past the end
+     * of the file extends the file to reach it, and the store maps a
+     * segment before it hands any of it out. Setting the size here
+     * instead would mean resizing a file that already has views of it,
+     * which Windows is entitled to refuse. */
+    (void)backing; (void)size; (void)err;
+#else
+    if (ftruncate(backing->fd, (off_t)size) != 0) {
+        *err = g_strdup_printf("can't size %s to %" PRIu64 " bytes: %s",
+                backing->path, size, g_strerror(errno));
+        return false;
+    }
+#endif
+
+    return true;
+}
+
 /* Add another piece of the backing file. Returns false with *err set if
  * the OS will not give us the space. */
 static bool
 wmem_backing_map_segment(wmem_backing_t *backing, uint64_t size, char **err)
 {
-#ifdef _WIN32
-    (void)backing; (void)size;
-    *err = g_strdup("disk-backed memory is not supported on this platform");
-    return false;
-#else
     wmem_backing_shared_t *shared = backing->shared;
     uint64_t               offset = shared->reserve;
 
@@ -262,11 +333,7 @@ wmem_backing_map_segment(wmem_backing_t *backing, uint64_t size, char **err)
         return false;
     }
 
-    /* Sparse: this sets the size of the file, it does not allocate any
-     * disk blocks. Blocks are allocated as pages are written back. */
-    if (ftruncate(backing->fd, (off_t)(offset + size)) != 0) {
-        *err = g_strdup_printf("can't size %s to %" PRIu64 " bytes: %s",
-                backing->path, offset + size, g_strerror(errno));
+    if (!wmem_backing_set_size(backing, offset + size, err)) {
         return false;
     }
 
@@ -280,7 +347,6 @@ wmem_backing_map_segment(wmem_backing_t *backing, uint64_t size, char **err)
             shared->segment_count - 1, 0);
 
     return true;
-#endif /* _WIN32 */
 }
 
 /* Hand the pages of a region back to the OS, and the disk blocks back to
@@ -324,7 +390,20 @@ wmem_backing_release(wmem_backing_t *backing, void *ptr, uint64_t offset,
     (void)ptr;
 #endif
 #else /* _WIN32 */
-    (void)backing; (void)ptr; (void)offset; (void)size;
+    FILE_ZERO_DATA_INFORMATION zero;
+    DWORD                      ret;
+
+    /* The equivalent of punching a hole in a sparse file. Best effort:
+     * a volume that will not do it keeps the blocks allocated, and the
+     * region is reused either way. There is no counterpart to
+     * MADV_DONTNEED for a mapped view, so the pages go when the cache
+     * manager decides they do. */
+    zero.FileOffset.QuadPart      = (LONGLONG)offset;
+    zero.BeyondFinalZero.QuadPart = (LONGLONG)(offset + size);
+    DeviceIoControl(backing->file, FSCTL_SET_ZERO_DATA, &zero,
+            sizeof(zero), NULL, 0, &ret, NULL);
+
+    (void)ptr;
 #endif
 }
 
@@ -345,8 +424,22 @@ wmem_backing_reserve(wmem_backing_t *backing, uint64_t offset, uint64_t size,
         char **err)
 {
 #ifdef _WIN32
-    (void)backing; (void)offset; (void)size; (void)err;
-    ws_assert_not_reached();
+    ULARGE_INTEGER avail;
+
+    (void)offset;
+
+    /* Windows has no way to allocate the blocks behind part of a sparse
+     * file - SetFileValidData() needs a privilege and does not apply to
+     * sparse ranges - so all that can be done is to look at what the
+     * volume says is left. A write that runs out anyway raises
+     * EXCEPTION_IN_PAGE_ERROR, which is as fatal as SIGBUS. */
+    if (GetDiskFreeSpaceExW(utf_8to16(backing->dir), &avail, NULL, NULL) &&
+            avail.QuadPart < size) {
+        *err = g_strdup("No space left on device");
+        return false;
+    }
+
+    return true;
 #else
     struct statvfs st;
 
@@ -382,9 +475,86 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
         char **err)
 {
 #ifdef _WIN32
-    (void)dir; (void)reserve; (void)threshold;
-    *err = g_strdup("disk-backed memory is not supported on this platform");
-    return NULL;
+    wmem_backing_t *backing;
+    char           *path;
+    HANDLE          file;
+    SYSTEM_INFO     info;
+    size_t          pagesize;
+    DWORD           ret;
+    unsigned        attempt;
+
+    /* A view has to start on an allocation granularity boundary, which
+     * is coarser than a page, so that is what the store rounds to. */
+    GetSystemInfo(&info);
+    pagesize = (size_t)info.dwAllocationGranularity;
+    reserve  = wmem_backing_round_up(reserve, pagesize);
+
+    if (dir == NULL) {
+        dir = g_get_tmp_dir();
+    }
+
+    /* There is no O_TMPFILE here and no unlinking a file that is open,
+     * so the file keeps its name for as long as the store exists.
+     * FILE_FLAG_DELETE_ON_CLOSE is what takes it away again, including
+     * when the process dies, and FILE_SHARE_DELETE lets that happen
+     * while the mapping still holds it. */
+    file = INVALID_HANDLE_VALUE;
+    path = NULL;
+    for (attempt = 0; attempt < 128; attempt++) {
+        path = g_strdup_printf("%s\\wireshark_wmem_%lu_%u", dir,
+                (unsigned long)GetCurrentProcessId(), attempt);
+
+        file = CreateFileW(utf_8to16(path), GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL, CREATE_NEW,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            break;
+        }
+
+        g_free(path);
+        path = NULL;
+        if (GetLastError() != ERROR_FILE_EXISTS) {
+            break;
+        }
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        *err = g_strdup_printf("can't create a temporary file in %s: %s",
+                dir, win32strerror(GetLastError()));
+        return NULL;
+    }
+
+    /* The store sizes the file to its whole address range, so a volume
+     * that will not hold a sparse file cannot hold the store: say so
+     * rather than asking it for 64 GB of real blocks. */
+    if (!DeviceIoControl(file, FSCTL_SET_SPARSE, NULL, 0, NULL, 0,
+                &ret, NULL)) {
+        *err = g_strdup_printf("%s can't hold a sparse file: %s", dir,
+                win32strerror(GetLastError()));
+        CloseHandle(file);
+        g_free(path);
+        return NULL;
+    }
+
+    backing             = g_new0(wmem_backing_t, 1);
+    backing->file       = file;
+    backing->path       = path;
+    backing->dir        = g_strdup(dir);
+    backing->pagesize   = pagesize;
+    backing->shared     = g_new0(wmem_backing_shared_t, 1);
+    backing->heap_sizes = g_hash_table_new(g_direct_hash, g_direct_equal);
+
+    InitializeSRWLock(&backing->shared->lock);
+
+    backing->shared->grow      = reserve;
+    backing->shared->threshold = threshold;
+
+    if (!wmem_backing_map_segment(backing, reserve, err)) {
+        wmem_backing_destroy(backing);
+        return NULL;
+    }
+
+    return backing;
 #else
     wmem_backing_t      *backing;
     char                *path;
@@ -449,6 +619,7 @@ wmem_backing_file_new(const char *dir, uint64_t reserve, uint64_t threshold,
     backing             = g_new0(wmem_backing_t, 1);
     backing->fd         = fd;
     backing->path       = path;
+    backing->dir        = g_strdup(dir);
     backing->pagesize   = pagesize;
     backing->shared     = (wmem_backing_shared_t *)shared;
     backing->heap_sizes = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -477,7 +648,24 @@ wmem_backing_destroy(wmem_backing_t *backing)
         return;
     }
 
-#ifndef _WIN32
+#ifdef _WIN32
+    {
+        unsigned i;
+
+        for (i = 0; i < backing->mapped; i++) {
+            if (backing->bases[i] != NULL) {
+                UnmapViewOfFile(backing->bases[i]);
+            }
+            if (backing->maps[i] != NULL) {
+                CloseHandle(backing->maps[i]);
+            }
+        }
+    }
+    /* The last handle to a file opened with FILE_FLAG_DELETE_ON_CLOSE
+     * is what deletes it. */
+    CloseHandle(backing->file);
+    g_free(backing->shared);
+#else
     {
         unsigned i;
 
@@ -494,6 +682,7 @@ wmem_backing_destroy(wmem_backing_t *backing)
 
     g_hash_table_destroy(backing->heap_sizes);
     g_free(backing->path);
+    g_free(backing->dir);
     g_free(backing);
 }
 

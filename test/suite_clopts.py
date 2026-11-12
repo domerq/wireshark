@@ -235,6 +235,39 @@ class TestTsharkShardPlan:
         assert process.returncode == ExitCodes.COMMAND_LINE
 
 
+class TestTsharkSpill:
+    def test_tshark_spill_dissects_the_same(self, cmd_tshark, capture_file, test_env, tmp_path):
+        '''State on disk has to produce the bytes state in RAM produces'''
+        args = ('-r', capture_file('http.pcap'), '-V', '-x')
+        plain = subprocesstest.run((cmd_tshark,) + args,
+            capture_output=True, env=test_env)
+        assert plain.returncode == 0
+        spilled = subprocesstest.run((cmd_tshark,) + args + (
+            '--spill-dir', str(tmp_path), '--spill-after', '0',
+        ), capture_output=True, env=test_env)
+        assert spilled.returncode == 0
+        assert spilled.stdout == plain.stdout
+        assert count_output(spilled.stderr, 'dissection state') == 1
+
+    def test_tshark_spill_leaves_nothing_behind(self, cmd_tshark, capture_file, test_env, tmp_path):
+        '''The backing file must not outlive the run'''
+        spill_dir = tmp_path / 'spill'
+        spill_dir.mkdir()
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('http.pcap'), '-q', '-z', 'conv,tcp',
+            '--spill-dir', str(spill_dir), '--spill-after', '0',
+        ), capture_output=True, env=test_env)
+        assert process.returncode == 0
+        assert list(spill_dir.iterdir()) == []
+
+    def test_tshark_spill_rejects_a_directory_that_is_not_there(self, cmd_tshark, capture_file, test_env, tmp_path):
+        process = subprocesstest.run((cmd_tshark,
+            '-r', capture_file('http.pcap'),
+            '--spill-dir', str(tmp_path / 'nowhere'),
+        ), capture_output=True, env=test_env)
+        assert process.returncode == ExitCodes.COMMAND_LINE
+
+
 @pytest.mark.skipif(sys.platform.startswith('win32'), reason='--jobs needs fork()')
 class TestTsharkJobs:
     @staticmethod
