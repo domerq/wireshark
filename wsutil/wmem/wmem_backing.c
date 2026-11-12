@@ -162,10 +162,20 @@ wmem_backing_base(wmem_backing_t *backing, unsigned segment)
                 backing->shared->segments[segment].size, g_strerror(errno));
     }
 
-#ifdef MADV_RANDOM
+#if defined(MADV_RANDOM) && defined(__APPLE__)
     /* Dissection state is reached through hash tables and trees, so a
-     * fault says nothing about which page is wanted next. Reading ahead
-     * around it would just multiply the I/O. */
+     * fault says nothing about which page is wanted next, and on Darwin
+     * reading ahead around it just multiplies the I/O: 1 M packets over
+     * 500 k flows at --spill-after 0 takes 41.2 s with this and 51.9 s
+     * without it.
+     *
+     * Linux is the other way round, by more. The same capture under a
+     * 1 GB cgroup limit takes 8.9 s when the kernel is left to read
+     * ahead and 22.0 s with MADV_RANDOM, because a fault that brings in
+     * one page at a time faults 896 k times rather than 613. The advice
+     * is therefore Darwin's alone, not an opinion about the access
+     * pattern.
+     */
     madvise(base, (size_t)backing->shared->segments[segment].size,
             MADV_RANDOM);
 #endif
@@ -298,12 +308,19 @@ wmem_backing_release(wmem_backing_t *backing, void *ptr, uint64_t offset,
     (void)offset;
 #endif
 
-    /* Discard the pages without writing them back; the contents of a
-     * freed region are not ours to preserve. */
+    /* Drop this process's pages. The punch above is what discards the
+     * contents and frees the blocks - MADV_DONTNEED on a shared file
+     * mapping only takes the pages away from us, leaving the data in the
+     * page cache to be written back - so where the punch worked this
+     * costs 3 to 7 us per 8 MB and changes nothing, and where it did not
+     * it is the only thing keeping the resident set down. MADV_FREE is
+     * not an alternative: it is for anonymous memory and returns EINVAL
+     * on a shared file mapping.
+     */
 #ifdef MADV_DONTNEED
     madvise(ptr, size, MADV_DONTNEED);
-#elif defined(MADV_FREE)
-    madvise(ptr, size, MADV_FREE);
+#else
+    (void)ptr;
 #endif
 #else /* _WIN32 */
     (void)backing; (void)ptr; (void)offset; (void)size;
