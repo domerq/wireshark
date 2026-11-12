@@ -208,8 +208,25 @@ Other shapes, at watermark 0 (worst case), against the same run without
 
 The second row is the adversarial case: 500 k flows touched round-robin, so
 no flow is ever in cache, and the run is almost entirely system time
-faulting pages back. MADV_RANDOM is what keeps it to that, rather than
-having readahead multiply every fault.
+faulting pages back. MADV_RANDOM is what holds it there on macOS, where
+reading ahead around a fault only multiplies the I/O: the same run takes
+51.9 s without the advice. Linux is the other way round and is told
+nothing (section 9).
+
+Linux pays far less for the same two shapes, because the pages that were
+written stay in its page cache and readahead amortizes the faults that do
+happen (Ubuntu, 7.0.0 kernel, 8 cores, 9.9 GB, ext4; range over repeated
+runs):
+
+    capture                            in RAM      spilled    spilled state
+    synthetic 300 k packets, 150 k fl  1.2-1.9 s   0.9-1.2 s      704 MB
+    synthetic 1 M packets, 500 k flows 4.3-5.0 s   5.5-7.3 s     2240 MB
+
+Those runs have RAM to spare, which is not what the option is for. Under a
+cgroup limit the unspilled run does not finish at all: 300 k packets over
+150 k flows under 512 MB is killed after 0.45 s, while --spill-after 256
+finishes it in 1.8 s; 1 M over 500 k under 1 GB with --spill-after 512
+finishes in 8.9 s with 1728 MB of the state on disk.
 
 8. Limits and next steps
 ------------------------
@@ -296,6 +313,29 @@ address space against the few hundred megabytes actually in use - and holding
 blocks really do come back. The shared bookkeeping works the same on both:
 four forked workers allocating from one store give byte-identical output on
 Linux and macOS alike.
+
+What the two kernels are told about the pages is measured rather than
+reasoned about, and it differs. macOS is told MADV_RANDOM, which is worth
+41.2 s against 51.9 s on the 500 k flow shape. Linux is told nothing: the
+same advice costs it 22.0 s against 8.9 s under a 1 GB limit, because
+switching readahead off turns every miss into its own fault (895572 major
+faults against 613). MADV_DONTNEED is not a way to discard a region's
+contents on either: on a shared file mapping it only takes the pages away
+from this process, and the punch is what frees the blocks and zeroes what
+is read back. MADV_FREE is for anonymous memory and returns EINVAL here.
+
+The file is created with O_TMPFILE where the filesystem supports it, so it
+has no name at any point in its life; where it does not - NFS and others -
+it is mkstemp() followed immediately by unlink(), which leaves a window of
+microseconds rather than of the whole mapping step.
+
+The blocks behind a region are allocated before the region is handed out,
+with fallocate() on Linux and a statvfs() check of the free space
+elsewhere. Without that, a sparse mapping over a filesystem that fills up
+does not fail an allocation: the write faults, the process gets SIGBUS and
+there is nothing to report. Filesystems that cannot preallocate (and macOS,
+where the check is all there is) still fault, so the check is a courtesy
+there rather than a guarantee.
 
 Resident set size is a misleading measure on both platforms: resident pages
 of the backing file count towards it even though they are evictable without

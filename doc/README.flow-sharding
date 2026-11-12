@@ -261,6 +261,24 @@ against 12.73 s, everything spilled 5.45 s against 3.91 s, and the same
 252 of 254 captures byte-identical under --jobs 3. The two that differ
 are the two listed in section 8.
 
+The spilled pair in that list was measured while the store still told
+Linux MADV_RANDOM, which cost it dearly and has since been made Darwin's
+alone (see README.memory-spill section 9). Re-measured on a synthetic
+capture of 1 M packets over 500 k flows, 2240 MB of state, summary
+output, everything spilled at --spill-after 0:
+
+    workers    unspilled    spilled
+    1            5.11 s      5.09 s
+    2            4.06 s      5.07 s
+    4            2.63 s      3.70 s
+
+All of those outputs are byte-identical. Spilling is free for one
+process there and takes about 40% of what the fourth worker gains;
+system time is what grows with it (1.74 s against 3.30 s at four
+workers), so it is the kernel work of faulting and writing back, not
+the dissection, and whether the shared store's lock is part of that has
+not been measured.
+
 The store is created before the fork and every worker allocates from
 it, so --spill-after is a watermark for the run and not for each
 worker, which matters because the worker that gets the largest

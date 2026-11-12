@@ -2470,8 +2470,13 @@ the operating system writes them back under memory pressure rather than
 failing the allocation, so a capture whose state exceeds RAM is analyzed
 slowly instead of not at all.
 
-The file is unlinked as soon as it is created, so it never appears in the
+The file has no name where the filesystem supports creating it without one,
+and is unlinked immediately where it does not, so it never appears in a
 directory listing and is reclaimed even if *TShark* is killed.
+
+Space for the state is claimed from the filesystem as it is needed, so a
+*--spill-dir* that runs out of room stops the run with an error naming the
+directory rather than failing somewhere in the middle of dissection.
 
 Unlike *-M*, no state is discarded, so results are identical to a run that
 keeps everything in memory, and two-pass analysis (*-2*) is supported.

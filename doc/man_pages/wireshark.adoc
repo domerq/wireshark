@@ -574,10 +574,12 @@ the operating system writes them back under memory pressure rather than
 failing the allocation, so a capture whose state exceeds RAM is analyzed
 slowly instead of not at all.
 
-The file is unlinked as soon as it is created, so it never appears in the
+The file has no name where the filesystem supports creating it without one,
+and is unlinked immediately where it does not, so it never appears in a
 directory listing and is reclaimed even if *Wireshark* is killed. No state
 is discarded, so results are identical to a run that keeps everything in
-memory.
+memory, and a *--spill-dir* that runs out of room stops with an error
+naming the directory.
 
 This does not bound what the packet list itself costs, which is about 180
 bytes per packet of Qt data structures, and reading a packet whose state
